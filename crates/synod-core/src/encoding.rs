@@ -256,6 +256,14 @@ impl Value {
         r.finish()?;
         Ok(v)
     }
+
+    /// Decodes one canonical value at the start of `bytes`, and returns it
+    /// with its length.
+    pub fn decode_prefix(bytes: &[u8]) -> Result<(Value, usize), DecodeError> {
+        let mut r = Reader::new(bytes);
+        let v = r.value(true)?;
+        Ok((v, r.pos))
+    }
 }
 
 impl PartialEq for Value {

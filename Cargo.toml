@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/synod-core", "crates/synod-sim"]
+members = ["crates/synod-core", "crates/synod-sim", "crates/synod-store"]
 
 [workspace.package]
 version = "0.0.1"
@@ -11,9 +11,11 @@ repository = "https://github.com/Jeanlr10/SynodSQL"
 
 [workspace.dependencies]
 synod-core = { path = "crates/synod-core" }
+synod-sim = { path = "crates/synod-sim" }
 blake3 = "1.8"
 proptest = "1.12"
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 missing_docs = "warn"

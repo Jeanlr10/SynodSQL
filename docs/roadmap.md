@@ -9,8 +9,8 @@ SynodSQL ships in six phases, and each phase ends with a measurable gate. Phases
 | Phase | Goal | Status |
 | --- | --- | --- |
 | 0. Foundations | Formats, HLC, row IDs, simulator, CI | **Done** |
-| 1. Single-node core on SQLite | Record every write in a form the merge can use | Next |
-| 2. Deterministic merge | `M(e) = merge(M(e−1), logs)`; offline file sync | |
+| 1. Single-node core on SQLite | Record every write in a form the merge can use | **Done** |
+| 2. Deterministic merge | `M(e) = merge(M(e−1), logs)`; offline file sync | Next |
 | 3. Sync and multi-node operation | Automatic epochs over a network | |
 | 4. Custom storage engine | Only if Phase 3 benchmarks show SQLite is the bottleneck | Conditional |
 | 5. Hot indexes and hardening | Read optimizations and long-lived deployments | |
@@ -60,14 +60,14 @@ One node records every write in a form that the merge can use. No merge and no n
 
 **Deliverables:**
 
-- [ ] Schema extension: a MERGE policy for each column, parsed and stored in a \_synod\_schema table
-- [ ] Managed tables use SQLite STRICT mode, so that a value has one type on every node (no '1' against 1)
-- [ ] Shadow columns: row\_id, write stamps, and a tombstone flag
-- [ ] Write API: assigns row IDs and HLC stamps, and writes one epoch log entry per change, with before-image, after-image, and transaction ID
-- [ ] Epoch seal: close the log at the HLC boundary and hash it
-- [ ] Prolly tree over (row\_id, row hash), updated in one batch at seal time
-- [ ] Base-state switch: write the merged state to a new file, then swap it in with an atomic rename
-- [ ] Read path: normal SQL reads on the local state, with tombstones hidden by views
+- [x] Schema extension: a MERGE policy for each column, parsed and stored in a \_synod\_schema table — `synod-store/src/schema.rs`, [spec 4.6](spec/v0.1.md)
+- [x] Managed tables use SQLite STRICT mode, so that a value has one type on every node (no '1' against 1)
+- [x] Shadow columns: row\_id, write stamps, and a tombstone flag — [spec 4.5](spec/v0.1.md)
+- [x] Write API: assigns row IDs and HLC stamps, and writes one epoch log entry per change, with before-image, after-image, and transaction ID — `Txn` in `synod-store/src/store.rs`
+- [x] Epoch seal: close the log at the HLC boundary and hash it — `Store::seal`, [spec 5.2](spec/v0.1.md)
+- [x] Prolly tree over (row\_id, row hash), updated in one batch at seal time — `synod-core/src/prolly.rs`, [spec 8](spec/v0.1.md)
+- [x] Base-state switch: write the merged state to a new file, then swap it in with an atomic rename — `Store::rewrite` and `Store::install`, [spec 5.3](spec/v0.1.md)
+- [x] Read path: normal SQL reads on the local state, with tombstones hidden by views — `Store::query`
 
 **Exit gate:**
 
@@ -76,6 +76,27 @@ One node records every write in a form that the merge can use. No merge and no n
 3. A simulated crash at any point loses no committed write.
 
 **Note:** measure the size cost of per-column stamps here. If it is too high, change to one stamp per row plus a short version number per column, before Phase 2 depends on the format.
+
+**Gate result:** met. `synod-store/tests/gate.rs`:
+
+1. A workload of inserts, updates, deletes, seals, base switches, and restarts runs against an independent model. The log must equal the model's expected entries exactly, and a replay of the log must give every stored row, stamps included. Every sealed log must hold exactly the entries of its epoch.
+2. The same rows, written in a random order with older versions first, give the same root hash on two nodes. The hash also equals an independent tree build and survives a base switch. A second node that applies the first node's log gets the same root hash.
+3. A crash VFS for SQLite (`synod-sim/src/sqlite.rs`) loses unsynced writes, tears sectors, and can stop at any disk operation. The test crashes a short run at **every** disk operation, and longer runs at random ones. After each crash, nothing that committed is lost, and the in-flight transaction is either fully present or fully absent.
+
+Planted bugs check the tests: `synchronous = NORMAL` loses committed writes, and counters written outside the transaction reuse a row ID. The gate tests catch both. A differential test (`tests/differential.rs`) runs the same random writes on plain SQLite: each write is accepted or rejected the same way, and the rows stay equal.
+
+**Stamp cost, measured** (`cargo run --release -p synod-store --example stamp_cost`, 50,000 rows of the white paper's inventory table):
+
+| Layout | Bytes per row |
+| --- | --- |
+| Plain SQLite table | 73.5 |
+| One 12-byte stamp per column, stored as is | 179.1 |
+| **Built: per-column stamps, each distinct stamp stored once plus a 1-byte index per column** | **123.5** |
+| Alternative: one stamp per row plus a 2-byte version per column | 117.4 |
+
+**Decision:** keep per-column stamps. The compact storage removes most of the cost, and the alternative would save only 6 more bytes per row but lose the per-column HLC that a late `lww` write needs (white paper, Section XI-A). The storage form is local ([spec 4.5](spec/v0.1.md)); the row hash and the log do not depend on it.
+
+**Not done in Phase 1:** flipped-bit tests (test strategy table). SQLite has no page checksums by default, so a flipped bit in a page is not detected. The root hash check of Phase 3 detects a bad row between nodes; SQLite's `cksumvfs` extension or the Phase 4 engine can add page checksums.
 
 ## Phase 2: Deterministic merge
 
@@ -211,8 +232,8 @@ These choices are still open. Each one has a recommendation and the phase by whi
 | Decision | Options | Recommendation | Settle by |
 | --- | --- | --- | --- |
 | Core language | Rust, Go, C, Python prototype | **Settled: Rust.** Memory safety, good SQLite bindings, and a fit for the Phase 4 engine | Phase 0 |
-| Write capture | Own write API, SQLite triggers, SQLite session extension | Own write API; test the session extension as a way to collect before- and after-images | Phase 1 |
-| Stamp size | Per-column stamps, or one per-row stamp plus per-column versions | Measure in Phase 1, then choose | Phase 1 |
+| Write capture | Own write API, SQLite triggers, SQLite session extension | **Settled: own write API.** It reads the before-image in the write's transaction, so it needs no extension. The session extension was not evaluated | Phase 1 |
+| Stamp size | Per-column stamps, or one per-row stamp plus per-column versions | **Settled: per-column stamps, stored compactly.** See the Phase 1 measurement | Phase 1 |
 | Default epoch length | A fixed value, or one derived from the conflict model | Configurable; derive the default from the Section 9 model and a target conflict rate | Phase 3 |
 | Manifest agreement | Rotating leader, Raft | Rotating leader first; Raft if split leaders happen in practice | Phase 3 |
 | Transport | HTTP/2 with mutual TLS, QUIC | HTTP/2 first for simple debugging | Phase 3 |

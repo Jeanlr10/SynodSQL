@@ -258,3 +258,62 @@ proptest! {
         prop_assert_eq!(d.to_string().parse::<Decimal>(), Ok(d));
     }
 }
+
+// ---------------------------------------------------------------- Prolly tree
+
+/// A plain reference build: split each level into nodes at the
+/// boundaries, then build the level above, until one node is left.
+fn reference_root(items: &[(RowId, RowHash)]) -> [u8; 32] {
+    use synod_core::prolly::{empty_root, is_boundary, node_hash};
+    if items.is_empty() {
+        return empty_root();
+    }
+    let mut level_items: Vec<(RowId, [u8; 32])> = items.iter().map(|(k, h)| (*k, h.0)).collect();
+    for level in 0u8.. {
+        let mut nodes: Vec<Vec<(RowId, [u8; 32])>> = vec![vec![]];
+        for (k, h) in &level_items {
+            nodes.last_mut().unwrap().push((*k, *h));
+            if is_boundary(level, *k) {
+                nodes.push(vec![]);
+            }
+        }
+        if nodes.last().unwrap().is_empty() {
+            nodes.pop();
+        }
+        let hashed: Vec<(RowId, [u8; 32])> = nodes
+            .iter()
+            .map(|node| {
+                let mut bytes = vec![level];
+                bytes.extend_from_slice(&(node.len() as u32).to_be_bytes());
+                for (k, h) in node {
+                    bytes.extend_from_slice(&k.to_be_bytes());
+                    bytes.extend_from_slice(h);
+                }
+                (node.last().unwrap().0, node_hash(&bytes))
+            })
+            .collect();
+        if hashed.len() == 1 {
+            return hashed[0].1;
+        }
+        level_items = hashed;
+    }
+    unreachable!()
+}
+
+proptest! {
+    /// The streaming builder gives the same root as the plain reference
+    /// build, for any set of rows, and the input order does not matter.
+    #[test]
+    fn prolly_matches_reference(keys in prop::collection::btree_set(any::<(u32, u64)>(), 0..3_000), seed in any::<u64>()) {
+        let items: Vec<(RowId, RowHash)> = keys
+            .iter()
+            .map(|&(n, c)| {
+                let id = RowId::new(NodeId(n % 4), c);
+                (id, RowHash(*blake3::hash(&[c.to_be_bytes(), seed.to_be_bytes()].concat()).as_bytes()))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_iter()
+            .collect();
+        prop_assert_eq!(synod_core::prolly::root_hash(items.clone()), reference_root(&items));
+    }
+}

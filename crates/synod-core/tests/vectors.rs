@@ -91,3 +91,22 @@ fn row_hash_vectors() {
         assert_eq!(row.hash().to_string(), expected, "{name}");
     }
 }
+
+/// Prolly tree roots. Items: row ID (node i mod 3, counter i), row hash
+/// BLAKE3(i as u64 big-endian), for i in 0..count. Computed independently
+/// with a Python build of specification Section 8.
+#[test]
+fn prolly_root_vectors() {
+    for (count, expected) in [
+        (0u64, "b781189e5bd7ace7f05f9a989290cd7108d714087a69ace91793215c50866679"),
+        (1, "2d8e105a6d69e84e12a13eefc864a6cdee51dc71c57a0f1d011daa626c0172b3"),
+        (1_000, "88a4dc5cadb474b40228847a267c48966c6dd7c07bf618e9f74992f4733f5ce8"),
+        (20_000, "56b7f3fadff3548968a4662b12ad9522496306da51e517bcd28e9e21056827a8"),
+    ] {
+        let mut items: Vec<(RowId, RowHash)> = (0..count)
+            .map(|i| (RowId::new(NodeId((i % 3) as u32), i), RowHash(*blake3::hash(&i.to_be_bytes()).as_bytes())))
+            .collect();
+        items.sort();
+        assert_eq!(hex(&synod_core::prolly::root_hash(items)), expected, "{count} items");
+    }
+}

@@ -13,8 +13,11 @@ pub mod disk;
 pub mod rng;
 mod seeds;
 mod sim;
+#[allow(unsafe_code)]
+pub mod sqlite;
 
 pub use disk::Disk;
 pub use rng::SimRng;
 pub use seeds::check_seeds;
 pub use sim::{ClockConfig, Config, Ctx, FaultConfig, NetConfig, Node, NodeIndex, Sim, Stats};
+pub use sqlite::CrashFs;

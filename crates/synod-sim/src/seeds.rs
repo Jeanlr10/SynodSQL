@@ -28,7 +28,7 @@ pub fn check_seeds(name: &str, default_runs: u64, test: impl Fn(u64)) {
         let seed = base.wrapping_add(i);
         if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| test(seed))) {
             eprintln!("\nsimulation `{name}` failed with seed {seed}");
-            eprintln!("replay: SYNOD_SEED={seed} cargo test -p synod-sim -- --exact {name}\n");
+            eprintln!("replay: SYNOD_SEED={seed} cargo test -- --exact {name}\n");
             panic::resume_unwind(payload);
         }
     }

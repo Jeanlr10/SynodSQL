@@ -1,0 +1,46 @@
+//! The single-node SynodSQL store on SQLite (Phase 1).
+//!
+//! A [`Store`] keeps the replicated state of one node in one SQLite file.
+//! Managed tables are declared with merge policies ([`schema`]). Every
+//! write goes through a [`Txn`], which gives each row a [`RowId`] and each
+//! change an HLC stamp, and records the change in the epoch log in the same
+//! SQLite transaction. [`Store::seal`] closes an epoch's log and computes
+//! the state hash.
+//!
+//! Reads use normal SQL on a view per table, which hides tombstones:
+//!
+//! ```
+//! use synod_core::Value;
+//! use synod_store::{Env, ManualClock, Store, StoreConfig};
+//! # let dir = std::env::temp_dir().join(format!("synod-doc-{}", std::process::id()));
+//! # std::fs::create_dir_all(&dir).unwrap();
+//! # let path = dir.join("node.db");
+//! # let path = path.to_str().unwrap();
+//!
+//! let clock = ManualClock::new(1_791_763_200_000);
+//! let env = Env { clock: std::sync::Arc::new(clock), ..Env::os() };
+//! let config = StoreConfig { node: synod_core::NodeId(1), genesis_ms: 0, epoch_len_ms: 60_000, max_drift_ms: 500 };
+//! let mut store = Store::open(path, config, env)?;
+//! store.create_table("CREATE TABLE stock (sku TEXT UNIQUE, qty INTEGER CHECK (qty >= 0) MERGE delta)")?;
+//!
+//! let mut txn = store.begin()?;
+//! txn.insert("stock", &[("sku", Value::Text("A-100".into())), ("qty", Value::Integer(500))])?;
+//! txn.commit()?;
+//!
+//! let rows = store.query("SELECT sku, qty FROM stock", &[])?;
+//! assert_eq!(rows.len(), 1);
+//! # std::fs::remove_dir_all(&dir).ok();
+//! # Ok::<(), synod_store::Error>(())
+//! ```
+//!
+//! [`RowId`]: synod_core::RowId
+
+pub mod env;
+mod error;
+pub mod schema;
+mod store;
+pub mod values;
+
+pub use env::{Clock, Env, FileSystem, ManualClock, OsFs, SystemClock};
+pub use error::{Error, Result};
+pub use store::{Commit, STORE_FORMAT, SealedLog, Store, StoreConfig, Txn};

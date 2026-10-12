@@ -32,15 +32,27 @@ Read the [white paper](docs/whitepaper.pdf) for the full model, and the [roadmap
 
 ## Status
 
-**Phase 0 (Foundations) is done.** Nothing here is a database yet. Phase 1 (a single-node core on SQLite) is next.
+**Phase 1 (single-node core on SQLite) is done.** One node records every write in a form that the merge can use. There is no merge and no network yet. Phase 2 (the deterministic merge) is next.
+
+```rust
+let mut store = Store::open("node.db", config, Env::os())?;
+store.create_table("CREATE TABLE stock (sku TEXT UNIQUE, qty INTEGER CHECK (qty >= 0) MERGE delta)")?;
+
+let mut txn = store.begin()?;                       // one HLC time, one transaction ID
+let id = txn.insert("stock", &[("sku", Value::Text("A-100".into())), ("qty", Value::Integer(500))])?;
+txn.update("stock", id, &[("qty", Value::Integer(350))])?;
+txn.commit()?;                                      // rows, log entries, counters: one SQLite commit
+
+store.query("SELECT sku, qty FROM stock", &[])?;    // a view; tombstones are hidden
+let sealed = store.seal()?;                         // at the epoch's end: log + hash + state hash
+```
 
 | Part | Where |
 | --- | --- |
-| Specification v0.1: row, log, and manifest formats; merge rules | [`docs/spec/v0.1.md`](docs/spec/v0.1.md) |
-| Hybrid logical clock with a drift check | [`crates/synod-core/src/hlc.rs`](crates/synod-core/src/hlc.rs) |
-| 128-bit row IDs, durable before use | [`crates/synod-core/src/row_id.rs`](crates/synod-core/src/row_id.rs) |
-| Canonical value and row encoding, row hash | [`crates/synod-core/src/encoding.rs`](crates/synod-core/src/encoding.rs) |
-| Deterministic simulator: virtual clocks, network, and disk with crash injection | [`crates/synod-sim`](crates/synod-sim) |
+| Specification v0.1: formats, schema language, log, state hash, merge rules | [`docs/spec/v0.1.md`](docs/spec/v0.1.md) |
+| HLC, row IDs, canonical encoding, epoch log format, Prolly tree | [`crates/synod-core`](crates/synod-core) |
+| Store on SQLite: schema with `MERGE`, write API, seal, base switch | [`crates/synod-store`](crates/synod-store) |
+| Deterministic simulator, and a SQLite VFS with crash injection | [`crates/synod-sim`](crates/synod-sim) |
 
 ## Build and test
 
@@ -53,8 +65,10 @@ cargo test --workspace
 The simulation tests run many seeds. On a failure they print the seed and a command that replays the run exactly:
 
 ```sh
-SYNOD_SEED=1234 cargo test -p synod-sim -- --exact hlc_and_row_ids_under_faults
+SYNOD_SEED=1234 cargo test -- --exact log_is_exact_and_crashes_lose_nothing
 ```
+
+The crash tests run real SQLite on an in-memory disk that loses unsynced writes at a crash. They need no setup.
 
 To run more seeds or more property cases:
 
