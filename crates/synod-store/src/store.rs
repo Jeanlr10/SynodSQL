@@ -597,8 +597,10 @@ fn decode_stamps(bytes: &[u8], columns: usize) -> Option<Vec<Stamp>> {
     let table_end = 2 + k * Stamp::ENCODED_LEN;
     let distinct: Vec<Stamp> = bytes
         .get(2..table_end)?
-        .chunks_exact(Stamp::ENCODED_LEN)
-        .map(|c| Stamp::from_be_bytes(c.try_into().unwrap()))
+        .as_chunks::<{ Stamp::ENCODED_LEN }>()
+        .0
+        .iter()
+        .map(|c| Stamp::from_be_bytes(*c))
         .collect();
     let wide = k > 256;
     let rest = &bytes[table_end..];
