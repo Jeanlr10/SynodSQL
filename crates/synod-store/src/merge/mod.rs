@@ -50,6 +50,11 @@ pub trait BaseState {
     /// Returns the indexes of the CHECK constraints of `table` that `row`
     /// fails. The rows of the base state do not matter here.
     fn failed_checks(&self, table: &TableSchema, row: &Row) -> Result<Vec<usize>>;
+
+    /// Returns the rows that garbage collection through `epoch` removes, in
+    /// row ID order: tombstones deleted in `epoch` or earlier, and
+    /// `_conflicts` rows with status `resolved` from `epoch` or earlier.
+    fn gc_candidates(&self, tables: &[Arc<TableSchema>], epoch: u64) -> Result<Vec<(u32, RowId)>>;
 }
 
 /// One log of a manifest.
@@ -77,6 +82,10 @@ pub struct MergeInput<'a> {
     /// If false, conflicts are found but not returned or written (for the
     /// local rebase of in-flight writes).
     pub record_conflicts: bool,
+    /// Garbage collection: remove the tombstones deleted in this epoch or
+    /// earlier, and the resolved conflicts of this epoch or earlier
+    /// (specification Section 7.7). The manifest sets it.
+    pub gc_through: Option<u64>,
 }
 
 /// What the merge changes.
@@ -87,6 +96,9 @@ pub struct MergeOutput {
     pub rows: BTreeMap<RowId, (u32, Row)>,
     /// The conflicts, sorted by (table, row, column, kind).
     pub conflicts: Vec<Conflict>,
+    /// Rows of M(e−1) that are not in M(e) (garbage collection), with their
+    /// table IDs.
+    pub removed: BTreeMap<RowId, u32>,
 }
 
 /// One node's changes to one row, from all of its logs in the manifest.
@@ -153,13 +165,31 @@ pub fn merge(base: &dyn BaseState, input: &MergeInput<'_>) -> Result<MergeOutput
             rows.insert(id, (table, row));
         }
     }
+    // Garbage collection: only rows that this merge did not touch.
+    let mut removed = BTreeMap::new();
+    if let Some(through) = input.gc_through {
+        for (table, id) in base.gc_candidates(tables, through)? {
+            if !rows.contains_key(&id) && !changes.contains_key(&id) {
+                removed.insert(id, table);
+            }
+        }
+    }
     if !input.record_conflicts {
-        return Ok(MergeOutput { rows, conflicts: Vec::new() });
+        return Ok(MergeOutput { rows, conflicts: Vec::new(), removed });
     }
     for c in &conflicts {
         rows.insert(c.row_id_in_table(), (0, c.to_row(input.conflict_stamp)));
     }
-    Ok(MergeOutput { rows, conflicts })
+    Ok(MergeOutput { rows, conflicts, removed })
+}
+
+/// Checks that a log is well formed for these tables: entries of its own
+/// node, known tables, images of the right length, and a valid order of
+/// operations per row. A leader puts only valid logs in a manifest; the
+/// merge rejects a manifest with an invalid log.
+pub fn validate_log(tables: &[Arc<TableSchema>], log: &LogInput) -> Result<()> {
+    let mut changes = BTreeMap::new();
+    log.entries.iter().try_for_each(|e| group(tables, &mut changes, log.node, e))
 }
 
 fn group(
@@ -235,6 +265,22 @@ fn recorded(node: NodeId, stamp: Stamp, values: Vec<Value>) -> Recorded {
     Recorded { node, hlc: stamp.hlc, values }
 }
 
+// Records entries that the merge cannot apply: a change to a row that is
+// not in the base state (for example removed by garbage collection), or a
+// new row that is already there. The row stays as it is.
+fn stale(
+    ctx: &mut constraints::Ctx<'_>,
+    schema: &TableSchema,
+    row_id: RowId,
+    rule: &str,
+    base: Option<&Row>,
+    writers: &BTreeMap<NodeId, NodeChange>,
+) {
+    let rec = writers.iter().map(|(n, c)| recorded(*n, c.last_stamp, c.last.clone())).collect();
+    let base = base.map(|r| r.cells.iter().map(|c| c.value.clone()).collect());
+    ctx.add(schema, row_id, None, ConflictKind::StaleWrite, rule, base.clone(), rec, base, None);
+}
+
 // Merges one row. Returns the new row, or None if the row does not change.
 fn merge_row(
     ctx: &mut constraints::Ctx<'_>,
@@ -243,21 +289,28 @@ fn merge_row(
     base_row: Option<&Row>,
     writers: &BTreeMap<NodeId, NodeChange>,
 ) -> Result<Option<Row>> {
+    let epoch = ctx.epoch;
     // A new row: only its creator can have changed it.
-    if let Some((node, c)) = writers.iter().find(|(_, c)| c.created) {
+    if let Some((_, c)) = writers.iter().find(|(_, c)| c.created) {
         if writers.len() > 1 || base_row.is_some() {
-            return Err(Error::Invalid(format!("row {row_id} was created by node {node} but also changed by others")));
+            stale(ctx, schema, row_id, "row_exists", base_row, writers);
+            return Ok(None);
         }
         let cells =
             c.last.iter().zip(&c.col_stamp).map(|(v, s)| Cell { stamp: s.unwrap(), value: v.clone() }).collect();
-        return Ok(Some(Row { row_id, tombstone: c.deleted, cells }));
+        return Ok(Some(Row { row_id, deleted: c.deleted.then_some(epoch), cells }));
     }
-    let base_row =
-        base_row.ok_or_else(|| Error::Invalid(format!("row {row_id} of {} is not in the base state", schema.name)))?;
+    let Some(base_row) = base_row else {
+        stale(ctx, schema, row_id, "row_missing", None, writers);
+        return Ok(None);
+    };
     let base_values: Vec<Value> = base_row.cells.iter().map(|c| c.value.clone()).collect();
     let deleters: Vec<(&NodeId, &NodeChange)> = writers.iter().filter(|(_, c)| c.deleted).collect();
     let updaters: Vec<(&NodeId, &NodeChange)> =
         writers.iter().filter(|(_, c)| !c.deleted && (0..schema.columns.len()).any(|i| c.changed(i))).collect();
+    // A row deleted in this merge gets this epoch; a row that was already a
+    // tombstone keeps its epoch.
+    let deleted = Some(base_row.deleted.unwrap_or(epoch));
 
     let merge_columns = |ctx: &mut constraints::Ctx<'_>, record: bool| -> Vec<Cell> {
         let mut cells = Vec::with_capacity(schema.columns.len());
@@ -291,14 +344,14 @@ fn merge_row(
         cells
     };
 
-    if !base_row.tombstone && deleters.is_empty() {
+    if !base_row.is_tombstone() && deleters.is_empty() {
         let cells = merge_columns(ctx, true);
-        let row = Row { row_id, tombstone: false, cells };
+        let row = Row { row_id, deleted: None, cells };
         return Ok((row != *base_row).then_some(row));
     }
     // A delete in this merge, or a row already deleted in the base.
     if updaters.is_empty() {
-        let row = Row { tombstone: true, ..base_row.clone() };
+        let row = Row { deleted, ..base_row.clone() };
         return Ok((row != *base_row).then_some(row));
     }
     let from_updaters =
@@ -306,18 +359,18 @@ fn merge_row(
     let from_deleters =
         || deleters.iter().map(|(n, c)| recorded(**n, c.last_stamp, c.last.clone())).collect::<Vec<_>>();
     let (row, rule, rec, applied) = match schema.delete_rule {
-        DeleteRule::DeleteWins => (Row { tombstone: true, ..base_row.clone() }, "delete_wins", from_updaters(), None),
+        DeleteRule::DeleteWins => (Row { deleted, ..base_row.clone() }, "delete_wins", from_updaters(), None),
         DeleteRule::UpdateWins => {
             let cells = merge_columns(ctx, true);
             let applied = cells.iter().map(|c| c.value.clone()).collect();
-            (Row { row_id, tombstone: false, cells }, "update_wins", from_deleters(), Some(applied))
+            (Row { row_id, deleted: None, cells }, "update_wins", from_deleters(), Some(applied))
         }
         DeleteRule::Flag => {
             let cells = merge_columns(ctx, false);
             let applied = cells.iter().map(|c| c.value.clone()).collect();
             let mut rec = from_updaters();
             rec.extend(from_deleters());
-            (Row { row_id, tombstone: true, cells }, "flag", rec, Some(applied))
+            (Row { row_id, deleted, cells }, "flag", rec, Some(applied))
         }
     };
     ctx.add(schema, row_id, None, ConflictKind::UpdateDelete, rule, Some(base_values), rec, applied, None);

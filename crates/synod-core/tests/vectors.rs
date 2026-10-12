@@ -24,7 +24,7 @@ fn dec(s: &str) -> Value {
 fn worked_example_r1() -> Row {
     Row {
         row_id: RowId::new(NodeId(0xA), 1),
-        tombstone: false,
+        deleted: None,
         cells: vec![
             Cell { stamp: stamp(1, 0xA), value: Value::Text("A-100".into()) },
             Cell { stamp: stamp(11, 0xB), value: Value::Text("Bolt, M6 x 20".into()) },
@@ -79,13 +79,18 @@ fn row_vector() {
 fn row_hash_vectors() {
     let live = worked_example_r1();
     let mut tombstone = live.clone();
-    tombstone.tombstone = true;
-    let empty = Row { row_id: RowId::new(NodeId(0), 0), tombstone: false, cells: vec![] };
+    tombstone.deleted = Some(7);
+    let empty = Row { row_id: RowId::new(NodeId(0), 0), deleted: None, cells: vec![] };
     // Computed independently with the Python `blake3` package from the
-    // bytes in `row_vector`.
+    // bytes in `row_vector` (for the tombstone: flags 01, then the deleted
+    // epoch 0000000000000007).
     for (name, row, expected) in [
         ("worked example r1", &live, "64a5aae2a8e1bf8e32673a95713078ae9558dbe0b2e3767030565b714889f6e9"),
-        ("tombstone r1", &tombstone, "b36bea63f2c82b8ace1b8ab4b16bc1bc01201db40a6fec737bacce4964aee611"),
+        (
+            "tombstone r1, deleted in epoch 7",
+            &tombstone,
+            "07d0d1a3453da2e18effb62663c29b3361efc314493e6c05d1dabb4e2a75d21a",
+        ),
         ("empty row", &empty, "b58fd0ce6979f11331788fc81038eedd0197aa9123b27c90c269318e63559d22"),
     ] {
         assert_eq!(row.hash().to_string(), expected, "{name}");

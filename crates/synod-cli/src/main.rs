@@ -15,7 +15,7 @@ const USAGE: &str = "\
 usage: synod <command> [arguments]
 
 Node:
-  init <db> --node <id> [--epoch-ms <ms>] [--genesis-ms <ms>] [--max-drift-ms <ms>]
+  init <db> --node <id> [--epoch-ms <ms>] [--genesis-ms <ms>] [--max-drift-ms <ms>] [--lateness <epochs>]
                                        make a new node store
   clone <src-db> <new-db> --node <id>  make a new node from a peer's base state
   status <db>                          show the node, its epochs, and its state hash
@@ -123,7 +123,7 @@ fn run(args: &[String]) -> R<()> {
     let a = Args::parse(rest, &["all"]);
     match cmd.as_str() {
         "init" => {
-            a.known(&["node", "epoch-ms", "genesis-ms", "max-drift-ms"])?;
+            a.known(&["node", "epoch-ms", "genesis-ms", "max-drift-ms", "lateness"])?;
             let path = a.at(0, "<db>")?;
             if std::path::Path::new(path).exists() {
                 return Err(format!("{path} exists"));
@@ -135,6 +135,7 @@ fn run(args: &[String]) -> R<()> {
                 genesis_ms: a.num("genesis-ms", 0)?,
                 epoch_len_ms: a.num("epoch-ms", 60_000)?,
                 max_drift_ms: a.num("max-drift-ms", 500)?,
+                lateness: a.num("lateness", 16)?,
             };
             let s = Store::open(path, config, env()?).map_err(err)?;
             println!("node {} ready in {path}; first epoch {}", s.config().node, s.open_epoch().map_err(err)?);

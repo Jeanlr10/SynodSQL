@@ -117,6 +117,7 @@ fn stores_converge_and_match_the_pure_merge() {
                     .collect(),
                 conflict_stamp: Stamp { hlc: Hlc::new(end, 0).unwrap(), node: MERGE_NODE },
                 record_conflicts: true,
+                gc_through: None,
             };
             let out = merge(&reference, &input).unwrap();
             reference.apply(&out);

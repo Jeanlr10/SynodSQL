@@ -9,12 +9,14 @@
 pub mod encoding;
 pub mod hlc;
 pub mod log;
+pub mod manifest;
 pub mod prolly;
 pub mod row_id;
 
 pub use encoding::{Cell, Decimal, Row, RowHash, Value, ValueSet};
 pub use hlc::{Hlc, HlcClock, HlcError, Stamp};
 pub use log::{LogEntry, Op, TxnId};
+pub use manifest::{LogRef, Manifest};
 pub use row_id::{AllocError, CounterStore, RowId, RowIdAllocator};
 
 /// A 32-bit node ID. Each member node of a cluster has a unique ID.

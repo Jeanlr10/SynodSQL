@@ -349,8 +349,10 @@ pub struct Cell {
 pub struct Row {
     /// Logical row ID.
     pub row_id: RowId,
-    /// True if the row is deleted.
-    pub tombstone: bool,
+    /// `Some(e)` if the row is a tombstone: the epoch whose merge deleted
+    /// it (for a local delete before the merge, the epoch of the write).
+    /// Garbage collection removes a tombstone L epochs after `e`.
+    pub deleted: Option<u64>,
     /// Columns, in schema order.
     pub cells: Vec<Cell>,
 }
@@ -372,6 +374,11 @@ impl fmt::Display for RowHash {
 }
 
 impl Row {
+    /// Returns true if the row is deleted.
+    pub fn is_tombstone(&self) -> bool {
+        self.deleted.is_some()
+    }
+
     /// Appends the canonical encoding to `out`.
     ///
     /// # Panics
@@ -380,7 +387,13 @@ impl Row {
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         out.push(ROW_FORMAT_VERSION);
         out.extend_from_slice(&self.row_id.to_be_bytes());
-        out.push(if self.tombstone { FLAG_TOMBSTONE } else { 0 });
+        match self.deleted {
+            None => out.push(0),
+            Some(epoch) => {
+                out.push(FLAG_TOMBSTONE);
+                out.extend_from_slice(&epoch.to_be_bytes());
+            }
+        }
         let count = u16::try_from(self.cells.len()).expect("more than u16::MAX columns");
         out.extend_from_slice(&count.to_be_bytes());
         for cell in &self.cells {
@@ -404,9 +417,9 @@ impl Row {
             return Err(DecodeError::UnsupportedVersion(version));
         }
         let row_id = RowId::from_be_bytes(r.array()?).ok_or(DecodeError::ReservedBits)?;
-        let tombstone = match r.u8()? {
-            0 => false,
-            FLAG_TOMBSTONE => true,
+        let deleted = match r.u8()? {
+            0 => None,
+            FLAG_TOMBSTONE => Some(u64::from_be_bytes(r.array()?)),
             _ => return Err(DecodeError::ReservedBits),
         };
         let count = u16::from_be_bytes(r.array()?);
@@ -417,7 +430,7 @@ impl Row {
             cells.push(Cell { stamp, value });
         }
         r.finish()?;
-        Ok(Row { row_id, tombstone, cells })
+        Ok(Row { row_id, deleted, cells })
     }
 
     /// Returns the row hash: BLAKE3 in key-derivation mode, with context

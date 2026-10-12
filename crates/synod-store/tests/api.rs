@@ -49,7 +49,7 @@ fn insert_update_delete_and_views() {
     assert_eq!(s.query("SELECT count(*) FROM inventory", &[]).unwrap(), vec![vec![Sql::Integer(1)]]);
     assert_eq!(s.get("inventory", a).unwrap(), None);
     let tomb = s.row("inventory", a).unwrap().unwrap();
-    assert!(tomb.tombstone);
+    assert!(tomb.is_tombstone());
     assert_eq!(tomb.cells[0].value, text("A-100"), "a tombstone keeps its values");
 
     let ops: Vec<Op> = s.all_entries().unwrap().iter().map(|e| e.op).collect();

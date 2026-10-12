@@ -52,6 +52,9 @@ impl MemState {
         for (id, (table, row)) in &output.rows {
             self.rows.insert(*id, (*table, row.clone()));
         }
+        for id in output.removed.keys() {
+            self.rows.remove(id);
+        }
     }
 
     /// Returns the state hash.
@@ -70,7 +73,9 @@ impl BaseState for MemState {
             .rows
             .iter()
             .filter(|(_, (t, r))| {
-                *t == table.id && !r.tombstone && columns.iter().zip(values).all(|(&c, v)| key_eq(&r.cells[c].value, v))
+                *t == table.id
+                    && !r.is_tombstone()
+                    && columns.iter().zip(values).all(|(&c, v)| key_eq(&r.cells[c].value, v))
             })
             .map(|(id, _)| *id)
             .collect())
@@ -79,4 +84,22 @@ impl BaseState for MemState {
     fn failed_checks(&self, table: &TableSchema, row: &Row) -> Result<Vec<usize>> {
         failed_checks(&self.sql, table, row)
     }
+
+    fn gc_candidates(&self, _tables: &[Arc<TableSchema>], epoch: u64) -> Result<Vec<(u32, RowId)>> {
+        Ok(self
+            .rows
+            .iter()
+            .filter(|(_, (t, r))| match r.deleted {
+                Some(d) => d <= epoch,
+                None => *t == 0 && resolved_through(r, epoch),
+            })
+            .map(|(id, (t, _))| (*t, *id))
+            .collect())
+    }
+}
+
+/// True if a `_conflicts` row is resolved and from `epoch` or earlier.
+pub(crate) fn resolved_through(row: &Row, epoch: u64) -> bool {
+    matches!(row.cells[1].value, Value::Integer(e) if e as u64 <= epoch)
+        && row.cells[11].value == Value::Text("resolved".into())
 }

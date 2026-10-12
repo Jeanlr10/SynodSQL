@@ -20,7 +20,7 @@
 //!
 //! let clock = ManualClock::new(1_791_763_200_000);
 //! let env = Env { clock: std::sync::Arc::new(clock), ..Env::os() };
-//! let config = StoreConfig { node: synod_core::NodeId(1), genesis_ms: 0, epoch_len_ms: 60_000, max_drift_ms: 500 };
+//! let config = StoreConfig { node: synod_core::NodeId(1), genesis_ms: 0, epoch_len_ms: 60_000, max_drift_ms: 500, lateness: 16 };
 //! let mut store = Store::open(path, config, env)?;
 //! store.create_table("CREATE TABLE stock (sku TEXT UNIQUE, qty INTEGER CHECK (qty >= 0) MERGE delta)")?;
 //!
@@ -47,4 +47,4 @@ pub mod values;
 pub use env::{Clock, Env, FileSystem, ManualClock, OsFs, SystemClock};
 pub use error::{Error, Result};
 pub use store::{Commit, STORE_FORMAT, SealedLog, Store, StoreConfig, Txn};
-pub use sync::MergeReport;
+pub use sync::{BaseImage, BaseRow, MergeReport, MergedLog, MergedRecord, RevertReport};

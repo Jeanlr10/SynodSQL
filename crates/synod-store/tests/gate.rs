@@ -217,7 +217,7 @@ fn verify(store: &mut Store, model: &Model, in_flight: Option<&Model>) -> Model 
     for (id, row) in &replayed {
         assert_eq!(store.row("inventory", *id).unwrap().as_ref(), Some(row), "row {id}");
         let (tomb, values) = &matched.rows[id];
-        assert_eq!(row.tombstone, *tomb);
+        assert_eq!(row.is_tombstone(), *tomb);
         assert_eq!(&row.cells.iter().map(|c| c.value.clone()).collect::<Vec<_>>(), values);
     }
     let stored = store.query("SELECT count(*) FROM _synod_t_inventory", &[]).unwrap();
@@ -304,7 +304,7 @@ fn random_row(rng: &mut SimRng, id: RowId) -> Row {
             },
         })
         .collect();
-    Row { row_id: id, tombstone: rng.chance(200_000), cells }
+    Row { row_id: id, deleted: rng.chance(200_000).then(|| rng.below(1000)), cells }
 }
 
 fn put_all(node: &Node, rows: &[Row]) -> Store {

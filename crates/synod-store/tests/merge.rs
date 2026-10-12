@@ -158,8 +158,8 @@ fn white_paper_worked_example() {
             row("C-400", "Spacer", "0.08", 200)
         ]
     );
-    assert!(s.row("inventory", r3).unwrap().unwrap().tombstone);
-    assert!(s.row("inventory", r5).unwrap().unwrap().tombstone);
+    assert!(s.row("inventory", r3).unwrap().unwrap().is_tombstone());
+    assert!(s.row("inventory", r5).unwrap().unwrap().is_tombstone());
 
     // _conflicts for epoch e: Table IX, exactly three rows.
     let conflicts = &reports[0].conflicts;

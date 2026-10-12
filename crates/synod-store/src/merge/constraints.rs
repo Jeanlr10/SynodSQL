@@ -98,7 +98,7 @@ impl Ctx<'_> {
             .collect();
         for (id, (table, row)) in &self.overlay {
             if *table == schema.id
-                && !row.tombstone
+                && !row.is_tombstone()
                 && columns.iter().zip(key).all(|(&c, v)| key_eq(&row.cells[c].value, v))
             {
                 ids.insert(*id);
@@ -118,7 +118,7 @@ impl Ctx<'_> {
     }
 
     fn tombstone(&mut self, table: u32, mut row: Row) -> Result<()> {
-        row.tombstone = true;
+        row.deleted = Some(self.epoch);
         self.replace(table, row)
     }
 
@@ -148,7 +148,7 @@ impl Ctx<'_> {
                 let Some((table, row)) = self.overlay.get(&id).cloned() else { break };
                 let schema = self.tables[table as usize].clone();
                 let Some(columns) = schema.uniques.get(key_index) else { break };
-                if row.tombstone {
+                if row.is_tombstone() {
                     break;
                 }
                 let key: Vec<Value> = columns.iter().map(|&c| row.cells[c].value.clone()).collect();
@@ -202,7 +202,7 @@ impl Ctx<'_> {
                 let mut kids = BTreeSet::new();
                 for &id in dirty {
                     let Some((table, row)) = self.overlay.get(&id).cloned() else { continue };
-                    if table == child.id && !row.tombstone && !matches!(row.cells[fk.column].value, Value::Null) {
+                    if table == child.id && !row.is_tombstone() && !matches!(row.cells[fk.column].value, Value::Null) {
                         kids.insert(id);
                     }
                     if table == parent.id {
@@ -210,16 +210,16 @@ impl Ctx<'_> {
                         // the ones this pass replaced.
                         let mut versions: Vec<Row> = self.base.row(&parent, id)?.into_iter().collect();
                         versions.extend(self.replaced.get(&id).into_iter().flatten().cloned());
-                        for old in versions.iter().filter(|v| !v.tombstone) {
+                        for old in versions.iter().filter(|v| !v.is_tombstone()) {
                             let v = &old.cells[pcol].value;
-                            if !matches!(v, Value::Null) && (row.tombstone || !key_eq(&row.cells[pcol].value, v)) {
+                            if !matches!(v, Value::Null) && (row.is_tombstone() || !key_eq(&row.cells[pcol].value, v)) {
                                 kids.extend(self.find_live(child, &[fk.column], std::slice::from_ref(v))?);
                             }
                         }
                     }
                 }
                 for kid in kids {
-                    let Some(row) = self.get(child, kid)?.filter(|r| !r.tombstone) else { continue };
+                    let Some(row) = self.get(child, kid)?.filter(|r| !r.is_tombstone()) else { continue };
                     let v = row.cells[fk.column].value.clone();
                     if matches!(v, Value::Null)
                         || !self.find_live(&parent, &[pcol], std::slice::from_ref(&v))?.is_empty()
@@ -250,7 +250,7 @@ impl Ctx<'_> {
                     let mut restorable = None;
                     if let Some(pid) =
                         self.base.find_live(&parent, &[pcol], std::slice::from_ref(&v))?.into_iter().next()
-                        && self.get(&parent, pid)?.is_some_and(|r| r.tombstone)
+                        && self.get(&parent, pid)?.is_some_and(|r| r.is_tombstone())
                     {
                         restorable = Some(pid);
                     }
@@ -296,7 +296,8 @@ impl Ctx<'_> {
     // CHECK constraints: a merged row that breaks one stays as it is, and
     // the break is recorded (white paper, Section VII-F).
     fn check_pass(&mut self) -> Result<()> {
-        let rows: Vec<(u32, Row)> = self.overlay.values().filter(|(t, r)| *t != 0 && !r.tombstone).cloned().collect();
+        let rows: Vec<(u32, Row)> =
+            self.overlay.values().filter(|(t, r)| *t != 0 && !r.is_tombstone()).cloned().collect();
         for (table, row) in rows {
             let schema = self.tables[table as usize].clone();
             let failed = self.base.failed_checks(&schema, &row)?;

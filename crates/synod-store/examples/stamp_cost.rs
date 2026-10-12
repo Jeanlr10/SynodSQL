@@ -68,8 +68,13 @@ fn main() {
     // SynodSQL.
     let path = dir.join("synod.db");
     let env = Env { clock: Arc::new(ManualClock::new(1_791_763_200_000)), ..Env::os() };
-    let config =
-        StoreConfig { node: NodeId(1), genesis_ms: 1_791_763_200_000, epoch_len_ms: 60_000, max_drift_ms: 500 };
+    let config = StoreConfig {
+        node: NodeId(1),
+        genesis_ms: 1_791_763_200_000,
+        epoch_len_ms: 60_000,
+        max_drift_ms: 500,
+        lateness: 16,
+    };
     let mut store = Store::open(path.to_str().unwrap(), config, env).unwrap();
     store.create_table(INVENTORY).unwrap();
     let mut t = store.begin().unwrap();

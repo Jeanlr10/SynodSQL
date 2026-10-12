@@ -45,6 +45,10 @@ pub enum ConflictKind {
     ForeignKey,
     /// A CHECK constraint that the merged row breaks.
     Check,
+    /// A write that the merge cannot apply: its row is not in the base
+    /// state, or a new row is already there; or a log too late to merge
+    /// (older than the lateness bound).
+    StaleWrite,
 }
 
 impl ConflictKind {
@@ -55,6 +59,7 @@ impl ConflictKind {
             ConflictKind::UniqueKey => 3,
             ConflictKind::ForeignKey => 4,
             ConflictKind::Check => 5,
+            ConflictKind::StaleWrite => 6,
         }
     }
 
@@ -66,11 +71,12 @@ impl ConflictKind {
             ConflictKind::UniqueKey => "unique_key",
             ConflictKind::ForeignKey => "foreign_key",
             ConflictKind::Check => "check",
+            ConflictKind::StaleWrite => "stale_write",
         }
     }
 
     fn parse(s: &str) -> Option<ConflictKind> {
-        [Self::SameColumn, Self::UpdateDelete, Self::UniqueKey, Self::ForeignKey, Self::Check]
+        [Self::SameColumn, Self::UpdateDelete, Self::UniqueKey, Self::ForeignKey, Self::Check, Self::StaleWrite]
             .into_iter()
             .find(|k| k.as_str() == s)
     }
@@ -236,7 +242,7 @@ impl Conflict {
         ];
         Row {
             row_id: self.row_id_in_table(),
-            tombstone: false,
+            deleted: None,
             cells: values.into_iter().map(|value| Cell { stamp, value }).collect(),
         }
     }

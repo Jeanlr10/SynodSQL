@@ -14,6 +14,9 @@
 //! | `_synod_dirty` | rows written outside the log since the last state hash |
 //! | `_synod_undo` | the base-state version of each row changed since the last merge |
 //! | `_synod_merged`, `_synod_merged_log` | merged epochs, their manifests and roots |
+//! | `_synod_logs` | every sealed log this node knows (its own and its peers'), for L epochs |
+//! | `_synod_merge_undo` | the M(e−1) version of each row a merge changed, for L epochs (unmerge) |
+//! | `_synod_tree`, `_synod_base_hash` | Prolly tree nodes and row hashes of the base state (diffs) |
 //! | `_conflicts` (managed table 0) | conflicts that merges recorded |
 //!
 //! A write changes its row, its log entry, and the counters in one SQLite
@@ -34,7 +37,7 @@ use crate::schema::{TableSchema, parse_create_table, parse_system_table};
 use crate::values;
 
 /// Version of the store file layout.
-pub const STORE_FORMAT: i64 = 2;
+pub const STORE_FORMAT: i64 = 3;
 
 const SETUP: &str = "
 CREATE TABLE _synod_node (
@@ -51,7 +54,8 @@ CREATE TABLE _synod_node (
     base_root BLOB NOT NULL,
     hashed_seq INTEGER NOT NULL,
     first_epoch INTEGER NOT NULL,
-    merged_epoch INTEGER
+    merged_epoch INTEGER,
+    lateness INTEGER NOT NULL
 ) STRICT;
 CREATE TABLE _synod_schema (
     table_id INTEGER PRIMARY KEY,
@@ -89,9 +93,35 @@ CREATE TABLE _synod_undo (
 CREATE TABLE _synod_merged (
     epoch INTEGER PRIMARY KEY,
     manifest BLOB NOT NULL,
+    manifest_hash BLOB NOT NULL,
+    rank INTEGER NOT NULL,
+    base_before BLOB NOT NULL,
     root BLOB NOT NULL,
     conflicts INTEGER NOT NULL
 ) STRICT;
+CREATE TABLE _synod_logs (
+    log_hash BLOB PRIMARY KEY,
+    node INTEGER NOT NULL,
+    epoch INTEGER NOT NULL,
+    log BLOB NOT NULL,
+    abandoned INTEGER NOT NULL DEFAULT 0
+) STRICT, WITHOUT ROWID;
+CREATE INDEX _synod_logs_epoch ON _synod_logs (epoch, node);
+CREATE TABLE _synod_merge_undo (
+    epoch INTEGER NOT NULL,
+    row_id BLOB NOT NULL,
+    tbl INTEGER NOT NULL,
+    row BLOB,
+    PRIMARY KEY (epoch, row_id)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE _synod_tree (
+    hash BLOB PRIMARY KEY,
+    node BLOB NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE TABLE _synod_base_hash (
+    row_id BLOB PRIMARY KEY,
+    hash BLOB NOT NULL
+) STRICT, WITHOUT ROWID;
 CREATE TABLE _synod_merged_log (
     log_hash BLOB PRIMARY KEY,
     merged_in INTEGER NOT NULL,
@@ -111,6 +141,9 @@ pub struct StoreConfig {
     pub epoch_len_ms: u64,
     /// HLC drift limit.
     pub max_drift_ms: u64,
+    /// Lateness bound L, in epochs: logs, merge records, and tombstones
+    /// are kept this long (white paper, Section XI).
+    pub lateness: u64,
 }
 
 /// A sealed epoch log.
@@ -200,7 +233,7 @@ impl Store {
             let open_epoch = now.saturating_sub(config.genesis_ms) / config.epoch_len_ms;
             conn.execute_batch(&format!("BEGIN IMMEDIATE; {SETUP}"))?;
             conn.execute(
-                "INSERT INTO _synod_node VALUES (0, ?1, ?2, ?3, ?4, ?5, 0, 0, 0, ?6, ?7, 0, ?6, NULL)",
+                "INSERT INTO _synod_node VALUES (0, ?1, ?2, ?3, ?4, ?5, 0, 0, 0, ?6, ?7, 0, ?6, NULL, ?8)",
                 params![
                     STORE_FORMAT,
                     config.node.0,
@@ -209,15 +242,20 @@ impl Store {
                     config.max_drift_ms as i64,
                     open_epoch as i64,
                     synod_core::prolly::empty_root().to_vec(),
+                    config.lateness as i64,
                 ],
+            )?;
+            conn.execute(
+                "INSERT INTO _synod_tree (hash, node) VALUES (?1, ?2)",
+                params![synod_core::prolly::empty_root().to_vec(), vec![0u8; 5]],
             )?;
             conn.execute_batch("COMMIT")?;
         }
-        let (format, node, genesis, len, drift, hlc_last, open_epoch): (i64, u32, i64, i64, i64, i64, i64) = conn
-            .query_row(
-                "SELECT format, node, genesis_ms, epoch_len_ms, max_drift_ms, hlc_last, open_epoch FROM _synod_node",
+        let (format, node, genesis, len, drift, hlc_last, open_epoch, lateness): (i64, u32, i64, i64, i64, i64, i64, i64) =
+            conn.query_row(
+                "SELECT format, node, genesis_ms, epoch_len_ms, max_drift_ms, hlc_last, open_epoch, lateness FROM _synod_node",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
             )?;
         if format != STORE_FORMAT {
             return Err(Error::Corrupt(format!("store format {format}, expected {STORE_FORMAT}")));
@@ -227,6 +265,7 @@ impl Store {
             genesis_ms: genesis as u64,
             epoch_len_ms: len as u64,
             max_drift_ms: drift as u64,
+            lateness: lateness as u64,
         };
         if stored != config {
             return Err(Error::Invalid(format!("store was made with {stored:?}, opened with {config:?}")));
@@ -268,12 +307,13 @@ impl Store {
             None => Connection::open_with_flags(path, flags)?,
         };
         let config = conn
-            .query_row("SELECT node, genesis_ms, epoch_len_ms, max_drift_ms FROM _synod_node", [], |r| {
+            .query_row("SELECT node, genesis_ms, epoch_len_ms, max_drift_ms, lateness FROM _synod_node", [], |r| {
                 Ok(StoreConfig {
                     node: NodeId(r.get(0)?),
                     genesis_ms: r.get::<_, i64>(1)? as u64,
                     epoch_len_ms: r.get::<_, i64>(2)? as u64,
                     max_drift_ms: r.get::<_, i64>(3)? as u64,
+                    lateness: r.get::<_, i64>(4)? as u64,
                 })
             })
             .map_err(|e| Error::Invalid(format!("{path} is not a SynodSQL store: {e}")))?;
@@ -424,7 +464,7 @@ impl Store {
     /// Returns the values of a live row.
     pub fn get(&self, table: &str, row_id: RowId) -> Result<Option<Vec<Value>>> {
         let schema = self.table(table)?;
-        Ok(read_row(&self.conn, &schema, row_id)?.filter(|r| !r.tombstone).map(|r| row_values(&r)))
+        Ok(read_row(&self.conn, &schema, row_id)?.filter(|r| !r.is_tombstone()).map(|r| row_values(&r)))
     }
 
     /// Returns a row in its replicated form, tombstones included.
@@ -505,6 +545,10 @@ impl Store {
             s.conn.execute(
                 "INSERT INTO _synod_sealed (epoch, log_hash, log, entries, root) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![epoch as i64, hash.to_vec(), bytes, bodies.len() as i64, root.to_vec()],
+            )?;
+            s.conn.execute(
+                "INSERT OR IGNORE INTO _synod_logs (log_hash, node, epoch, log) VALUES (?1, ?2, ?3, ?4)",
+                params![hash.to_vec(), s.config.node.0, epoch as i64, bytes],
             )?;
             s.conn.execute(
                 "UPDATE _synod_node SET open_epoch = ?1, hlc_last = max(hlc_last, ?2)",
@@ -704,14 +748,15 @@ pub(crate) fn read_row(conn: &Connection, schema: &TableSchema, row_id: RowId) -
     let mut stmt = conn.prepare_cached(&sql)?;
     let mut rows = stmt.query([row_id.to_be_bytes().to_vec()])?;
     let Some(r) = rows.next()? else { return Ok(None) };
-    let tombstone: i64 = r.get(0)?;
+    // _tomb: 0 for a live row, else the deleted epoch + 1.
+    let tomb: i64 = r.get(0)?;
     let stamps = decode_stamps(&r.get::<_, Vec<u8>>(1)?, schema.columns.len())
         .ok_or_else(|| Error::Corrupt(format!("row {row_id}: bad stamps")))?;
     let mut cells = Vec::with_capacity(schema.columns.len());
     for (i, (column, stamp)) in schema.columns.iter().zip(stamps).enumerate() {
         cells.push(Cell { stamp, value: values::from_sql(column, r.get_ref(i + 2)?)? });
     }
-    Ok(Some(Row { row_id, tombstone: tombstone != 0, cells }))
+    Ok(Some(Row { row_id, deleted: (tomb != 0).then(|| tomb as u64 - 1), cells }))
 }
 
 pub(crate) fn write_row(conn: &Connection, schema: &TableSchema, row: &Row) -> Result<()> {
@@ -731,7 +776,7 @@ pub(crate) fn write_row(conn: &Connection, schema: &TableSchema, row: &Row) -> R
     let stamps = encode_stamps(&row.cells.iter().map(|c| c.stamp).collect::<Vec<_>>());
     let mut args: Vec<SqlValue> = vec![
         SqlValue::Blob(row.row_id.to_be_bytes().to_vec()),
-        SqlValue::Integer(row.tombstone as i64),
+        SqlValue::Integer(row.deleted.map_or(0, |e| e as i64 + 1)),
         SqlValue::Blob(stamps),
     ];
     args.extend(row.cells.iter().map(|c| values::to_sql(&c.value)));
@@ -763,6 +808,14 @@ impl Txn<'_> {
 
     fn stamp(&self) -> Stamp {
         Stamp { hlc: self.hlc, node: self.txn.node }
+    }
+
+    pub(crate) fn store_ref(&self) -> &Store {
+        self.store
+    }
+
+    pub(crate) fn store_conn(&self) -> &rusqlite::Connection {
+        &self.store.conn
     }
 
     // Runs one operation in a savepoint, so that a failed operation leaves
@@ -809,7 +862,7 @@ impl Txn<'_> {
             }
             let row_id = RowId::new(t.txn.node, t.next_row);
             t.next_row = t.next_row.checked_add(1).ok_or_else(|| Error::Invalid("row counter exhausted".into()))?;
-            let row = Row { row_id, tombstone: false, cells };
+            let row = Row { row_id, deleted: None, cells };
             record_undo(&t.store.conn, schema.id, row_id, None)?;
             write_row(&t.store.conn, &schema, &row)?;
             t.check_row(&schema, row_id)?;
@@ -855,7 +908,7 @@ impl Txn<'_> {
     fn delete_inner(&mut self, schema: &TableSchema, row_id: RowId) -> Result<()> {
         let before = self.live_row(schema, row_id)?;
         let mut after = before.clone();
-        after.tombstone = true;
+        after.deleted = Some(self.epoch);
         record_undo(&self.store.conn, schema.id, row_id, Some(&before))?;
         write_row(&self.store.conn, schema, &after)?;
         self.check_children(schema, &before, None)?;
@@ -950,7 +1003,7 @@ impl Txn<'_> {
     /// transaction.
     pub fn get(&self, table: &str, row_id: RowId) -> Result<Option<Vec<Value>>> {
         let schema = self.store.table(table)?;
-        Ok(read_row(&self.store.conn, &schema, row_id)?.filter(|r| !r.tombstone).map(|r| row_values(&r)))
+        Ok(read_row(&self.store.conn, &schema, row_id)?.filter(|r| !r.is_tombstone()).map(|r| row_values(&r)))
     }
 
     /// Commits the transaction.
@@ -966,7 +1019,7 @@ impl Txn<'_> {
 
     fn live_row(&self, schema: &TableSchema, row_id: RowId) -> Result<Row> {
         read_row(&self.store.conn, schema, row_id)?
-            .filter(|r| !r.tombstone)
+            .filter(|r| !r.is_tombstone())
             .ok_or_else(|| Error::Invalid(format!("no live row {row_id} in {}", schema.name)))
     }
 

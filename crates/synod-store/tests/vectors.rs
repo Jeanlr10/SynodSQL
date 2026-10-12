@@ -56,7 +56,7 @@ fn fixed_writes_give_the_pinned_state_hash() {
         ];
         Row {
             row_id: RowId::new(NodeId(5), i as u64),
-            tombstone: tomb,
+            deleted: tomb.then_some(0),
             cells: values.into_iter().map(|value| Cell { stamp: s, value }).collect(),
         }
     };
@@ -69,5 +69,5 @@ fn fixed_writes_give_the_pinned_state_hash() {
     let root = s.state_hash().unwrap();
     assert_eq!(root, synod_core::prolly::root_hash(expected.iter().map(|r| (r.row_id, r.hash()))));
     let hex: String = root.iter().map(|b| format!("{b:02x}")).collect();
-    assert_eq!(hex, "7f3431351f36d3768ca1132f09e7f5f96625102377d1ce1c82b5e2becd5c452c");
+    assert_eq!(hex, "205b5cda0ea62a4641955ad29f1fc3a615d6517e949a580ff2d51de37f031159");
 }

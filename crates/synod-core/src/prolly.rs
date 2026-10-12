@@ -164,6 +164,156 @@ pub fn root_hash(items: impl IntoIterator<Item = (RowId, RowHash)>) -> NodeHash 
     b.finish()
 }
 
+/// The items of a node: (key, row hash or child node hash).
+pub type NodeItems = Vec<(RowId, [u8; 32])>;
+
+/// Decodes a node: its level and its items (key, hash). At level 0 the
+/// hashes are row hashes; above, they are child node hashes. Returns
+/// `None` if the encoding is not valid.
+pub fn decode_node(node: &[u8]) -> Option<(u8, NodeItems)> {
+    let (&level, rest) = node.split_first()?;
+    let count = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+    let body = &rest[4..];
+    if body.len() != count.checked_mul(ITEM_LEN)? {
+        return None;
+    }
+    let items: NodeItems = body
+        .as_chunks::<ITEM_LEN>()
+        .0
+        .iter()
+        .map(|c| Some((RowId::from_be_bytes(c[..16].try_into().unwrap())?, c[16..].try_into().unwrap())))
+        .collect::<Option<_>>()?;
+    if !items.windows(2).all(|w| w[0].0 < w[1].0) {
+        return None;
+    }
+    Some((level, items))
+}
+
+/// Errors of a [`TreeWalk`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WalkError {
+    /// A node that was not asked for, or that does not have its hash.
+    UnexpectedNode,
+    /// A node that cannot be decoded, or has the wrong level.
+    BadNode,
+}
+
+/// Reads all items of a peer's tree, and fetches from the peer only the
+/// nodes that this side does not have (catch-up and repair, specification
+/// Section 6). It does no I/O: [`step`](TreeWalk::step) expands what the
+/// local lookup has and returns the hashes to fetch; give each fetched
+/// node to [`receive`](TreeWalk::receive) and step again. The same
+/// subtree hash means the same items, so nodes that both sides have
+/// never cross the network.
+pub struct TreeWalk {
+    // Nodes to expand: (hash, encoding).
+    ready: Vec<(NodeHash, Vec<u8>)>,
+    // Nodes to look up, then fetch.
+    unknown: Vec<NodeHash>,
+    wanted: std::collections::BTreeSet<NodeHash>,
+    items: Vec<(RowId, RowHash)>,
+    fetched: u64,
+}
+
+impl TreeWalk {
+    /// Starts a walk of the tree with this root hash.
+    pub fn new(root: NodeHash) -> TreeWalk {
+        TreeWalk { ready: Vec::new(), unknown: vec![root], wanted: Default::default(), items: Vec::new(), fetched: 0 }
+    }
+
+    /// Expands every node that `local` has, and returns the hashes of the
+    /// nodes to fetch from the peer. When it returns no hashes and no
+    /// fetch is open, the walk is done.
+    pub fn step(&mut self, mut local: impl FnMut(&NodeHash) -> Option<Vec<u8>>) -> Result<Vec<NodeHash>, WalkError> {
+        let mut fetch = Vec::new();
+        loop {
+            while let Some(h) = self.unknown.pop() {
+                match local(&h).filter(|n| node_hash(n) == h) {
+                    Some(n) => self.ready.push((h, n)),
+                    None => {
+                        if self.wanted.insert(h) {
+                            fetch.push(h);
+                        }
+                    }
+                }
+            }
+            let Some((_, node)) = self.ready.pop() else { break };
+            let (level, items) = decode_node(&node).ok_or(WalkError::BadNode)?;
+            if level == 0 {
+                self.items.extend(items.into_iter().map(|(k, h)| (k, RowHash(h))));
+            } else {
+                self.unknown.extend(items.into_iter().map(|(_, h)| h));
+            }
+        }
+        Ok(fetch)
+    }
+
+    /// Takes a node fetched from the peer.
+    pub fn receive(&mut self, hash: NodeHash, node: Vec<u8>) -> Result<(), WalkError> {
+        if !self.wanted.remove(&hash) || node_hash(&node) != hash {
+            return Err(WalkError::UnexpectedNode);
+        }
+        self.fetched += 1;
+        self.ready.push((hash, node));
+        Ok(())
+    }
+
+    /// Returns the number of nodes that are asked for and not received.
+    pub fn open_fetches(&self) -> usize {
+        self.wanted.len()
+    }
+
+    /// Returns the number of nodes received from the peer.
+    pub fn fetched(&self) -> u64 {
+        self.fetched
+    }
+
+    /// Returns all items of the peer's tree, in key order, and checks that
+    /// they have the root hash.
+    pub fn finish(mut self, root: NodeHash) -> Result<Vec<(RowId, RowHash)>, WalkError> {
+        if !self.wanted.is_empty() || !self.unknown.is_empty() || !self.ready.is_empty() {
+            return Err(WalkError::UnexpectedNode);
+        }
+        self.items.sort_by_key(|(k, _)| *k);
+        if root_hash(self.items.iter().copied()) != root {
+            return Err(WalkError::BadNode);
+        }
+        Ok(self.items)
+    }
+}
+
+/// Compares two sorted item lists. Returns the keys whose hash differs or
+/// that only `theirs` has, and the keys that only `ours` has.
+pub fn diff_hashes(ours: &[(RowId, RowHash)], theirs: &[(RowId, RowHash)]) -> (Vec<RowId>, Vec<RowId>) {
+    let (mut changed, mut removed) = (Vec::new(), Vec::new());
+    let (mut i, mut j) = (0, 0);
+    while i < ours.len() || j < theirs.len() {
+        match (ours.get(i), theirs.get(j)) {
+            (Some(a), Some(b)) if a.0 == b.0 => {
+                if a.1 != b.1 {
+                    changed.push(b.0);
+                }
+                i += 1;
+                j += 1;
+            }
+            (Some(a), Some(b)) if a.0 < b.0 => {
+                removed.push(a.0);
+                i += 1;
+            }
+            (Some(a), None) => {
+                removed.push(a.0);
+                i += 1;
+            }
+            (_, Some(b)) => {
+                changed.push(b.0);
+                j += 1;
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    (changed, removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +377,55 @@ mod tests {
         let mut v = sorted(0..10);
         v.swap(3, 4);
         root_hash(v);
+    }
+
+    #[test]
+    fn walk_fetches_only_differing_nodes() {
+        use std::collections::HashMap;
+        let items = |n: u64, skip: u64| -> Vec<(RowId, RowHash)> {
+            (0..n)
+                .filter(|i| i % 1000 != skip)
+                .map(|i| (RowId::new(NodeId(1), i), RowHash([(i % 251) as u8; 32])))
+                .collect()
+        };
+        let build = |it: &[(RowId, RowHash)]| {
+            let mut nodes = HashMap::new();
+            let mut b = TreeBuilder::with_sink(|h, n: &[u8]| {
+                nodes.insert(h, n.to_vec());
+            });
+            for (k, h) in it {
+                b.push(*k, *h);
+            }
+            let root = b.finish();
+            nodes.insert(empty_root(), vec![0; 5]);
+            (root, nodes)
+        };
+        let theirs = items(20_000, 7);
+        let mut ours = items(20_000, 3);
+        ours[100].1 = RowHash([9; 32]);
+        let (their_root, their_nodes) = build(&theirs);
+        let (_, our_nodes) = build(&ours);
+        let mut walk = TreeWalk::new(their_root);
+        loop {
+            let fetch = walk.step(|h| our_nodes.get(h).cloned()).unwrap();
+            if fetch.is_empty() {
+                break;
+            }
+            for h in fetch {
+                walk.receive(h, their_nodes[&h].clone()).unwrap();
+            }
+        }
+        let fetched = walk.fetched();
+        assert!(fetched < their_nodes.len() as u64 / 5, "{fetched} of {}", their_nodes.len());
+        let got = walk.finish(their_root).unwrap();
+        assert_eq!(got, theirs);
+        let (changed, removed) = diff_hashes(&ours, &got);
+        assert_eq!(removed.len(), 20);
+        assert_eq!(changed.len(), 21);
+        assert!(TreeWalk::new(their_root).receive([1; 32], vec![]).is_err());
+        let (empty, _) = build(&[]);
+        let mut w = TreeWalk::new(empty);
+        assert!(w.step(|_| Some(vec![0; 5])).unwrap().is_empty());
+        assert!(w.finish(empty).unwrap().is_empty());
     }
 }

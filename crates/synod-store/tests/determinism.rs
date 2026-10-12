@@ -56,7 +56,7 @@ struct Writer<'a> {
 
 impl Writer<'_> {
     fn live(&self, table: u32) -> Vec<RowId> {
-        self.rows.iter().filter(|(_, (t, r))| *t == table && !r.tombstone).map(|(id, _)| *id).collect()
+        self.rows.iter().filter(|(_, (t, r))| *t == table && !r.is_tombstone()).map(|(id, _)| *id).collect()
     }
 
     fn live_customer(&self, id: i64) -> Option<RowId> {
@@ -75,7 +75,7 @@ impl Writer<'_> {
         let row = match (&op, old) {
             (Op::Insert, _) => {
                 let cells = after.clone().unwrap().into_iter().map(|value| Cell { stamp, value }).collect();
-                Row { row_id, tombstone: false, cells }
+                Row { row_id, deleted: None, cells }
             }
             (Op::Update, Some(mut r)) => {
                 for (cell, v) in r.cells.iter_mut().zip(after.clone().unwrap()) {
@@ -85,7 +85,7 @@ impl Writer<'_> {
                 }
                 r
             }
-            (Op::Delete, Some(r)) => Row { tombstone: true, ..r },
+            (Op::Delete, Some(r)) => Row { deleted: Some(0), ..r },
             _ => unreachable!(),
         };
         self.rows.insert(row_id, (table, row));
@@ -234,7 +234,7 @@ fn local_writes(w: &mut Writer<'_>, rng: &mut SimRng, counter: &mut u64, clock: 
 }
 
 fn check_invariants(state: &MemState, out: &MergeOutput) {
-    let live = |t: u32| state.rows().values().filter(move |(tt, r)| *tt == t && !r.tombstone).map(|(_, r)| r);
+    let live = |t: u32| state.rows().values().filter(move |(tt, r)| *tt == t && !r.is_tombstone()).map(|(_, r)| r);
     let mut keys = BTreeSet::new();
     for c in live(CUSTOMER) {
         assert!(keys.insert(c.cells[0].value.clone()), "two live customers with id {:?}", c.cells[0].value);
@@ -327,6 +327,7 @@ fn history(seed: u64) {
             logs,
             conflict_stamp: Stamp { hlc: Hlc::new(T0 + 1_000_000 * (epoch + 1), 0).unwrap(), node: NodeId(u32::MAX) },
             record_conflicts: true,
+            gc_through: None,
         };
         let first = merge(&state, &input(logs.clone())).unwrap_or_else(|e| panic!("seed {seed}, epoch {epoch}: {e}"));
         for _ in 0..3 {

@@ -58,7 +58,13 @@ impl Node {
         Node {
             fs: Arc::new(CrashFs::new(seed)),
             clock: ManualClock::new(START_MS),
-            config: StoreConfig { node: NodeId(node), genesis_ms: START_MS, epoch_len_ms: EPOCH_MS, max_drift_ms: 500 },
+            config: StoreConfig {
+                node: NodeId(node),
+                genesis_ms: START_MS,
+                epoch_len_ms: EPOCH_MS,
+                max_drift_ms: 500,
+                lateness: 16,
+            },
         }
     }
 
@@ -91,11 +97,11 @@ pub fn replay(rows: &mut std::collections::BTreeMap<RowId, Row>, entries: &[LogE
                 assert!(current.is_none(), "insert of existing row {}", e.row_id);
                 let after = e.after.clone().unwrap();
                 let cells = after.into_iter().map(|value| Cell { stamp, value }).collect();
-                rows.insert(e.row_id, Row { row_id: e.row_id, tombstone: false, cells });
+                rows.insert(e.row_id, Row { row_id: e.row_id, deleted: None, cells });
             }
             Op::Update => {
                 let row = rows.get_mut(&e.row_id).expect("update of missing row");
-                assert!(!row.tombstone, "update of tombstone {}", e.row_id);
+                assert!(!row.is_tombstone(), "update of tombstone {}", e.row_id);
                 assert_eq!(current.as_ref(), e.before.as_ref(), "before-image of {}", e.row_id);
                 let (before, after) = (e.before.as_ref().unwrap(), e.after.as_ref().unwrap());
                 for (i, cell) in row.cells.iter_mut().enumerate() {
@@ -106,9 +112,9 @@ pub fn replay(rows: &mut std::collections::BTreeMap<RowId, Row>, entries: &[LogE
             }
             Op::Delete => {
                 let row = rows.get_mut(&e.row_id).expect("delete of missing row");
-                assert!(!row.tombstone, "delete of tombstone {}", e.row_id);
+                assert!(!row.is_tombstone(), "delete of tombstone {}", e.row_id);
                 assert_eq!(current.as_ref(), e.before.as_ref(), "before-image of {}", e.row_id);
-                row.tombstone = true;
+                row.deleted = Some((e.hlc.physical_ms() - START_MS) / EPOCH_MS);
             }
         }
     }

@@ -183,9 +183,8 @@ fn value() -> impl Strategy<Value = Value> {
 fn row() -> impl Strategy<Value = Row> {
     let cell = (any::<u64>(), any::<u32>(), value())
         .prop_map(|(h, n, value)| Cell { stamp: Stamp { hlc: Hlc::from_u64(h), node: NodeId(n) }, value });
-    (any::<u32>(), any::<u64>(), any::<bool>(), prop::collection::vec(cell, 0..8)).prop_map(
-        |(node, counter, tombstone, cells)| Row { row_id: RowId::new(NodeId(node), counter), tombstone, cells },
-    )
+    (any::<u32>(), any::<u64>(), any::<Option<u64>>(), prop::collection::vec(cell, 0..8))
+        .prop_map(|(node, counter, deleted, cells)| Row { row_id: RowId::new(NodeId(node), counter), deleted, cells })
 }
 
 proptest! {
@@ -242,7 +241,7 @@ proptest! {
         reversed.reverse();
         let make = |d, set_items: Vec<Value>, nan_bits| Row {
             row_id: id,
-            tombstone: false,
+            deleted: None,
             cells: vec![
                 Cell { stamp, value: Value::Decimal(d) },
                 Cell { stamp, value: Value::Set(ValueSet::new(set_items).unwrap()) },
