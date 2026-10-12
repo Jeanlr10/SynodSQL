@@ -1,11 +1,12 @@
-//! The single-node SynodSQL store on SQLite (Phase 1).
+//! The SynodSQL node store on SQLite, and the deterministic merge.
 //!
 //! A [`Store`] keeps the replicated state of one node in one SQLite file.
 //! Managed tables are declared with merge policies ([`schema`]). Every
 //! write goes through a [`Txn`], which gives each row a [`RowId`] and each
 //! change an HLC stamp, and records the change in the epoch log in the same
 //! SQLite transaction. [`Store::seal`] closes an epoch's log and computes
-//! the state hash.
+//! the state hash. [`Store::merge`] merges the epoch's logs of all nodes
+//! into the next base state M(e), with the pure function in [`merge`].
 //!
 //! Reads use normal SQL on a view per table, which hides tombstones:
 //!
@@ -37,10 +38,13 @@
 
 pub mod env;
 mod error;
+pub mod merge;
 pub mod schema;
 mod store;
+mod sync;
 pub mod values;
 
 pub use env::{Clock, Env, FileSystem, ManualClock, OsFs, SystemClock};
 pub use error::{Error, Result};
 pub use store::{Commit, STORE_FORMAT, SealedLog, Store, StoreConfig, Txn};
+pub use sync::MergeReport;

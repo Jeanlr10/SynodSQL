@@ -82,6 +82,43 @@ impl Decimal {
     pub fn scale(self) -> u8 {
         self.scale
     }
+
+    // The units at a larger scale.
+    fn units_at(self, scale: u8) -> Option<i128> {
+        self.units.checked_mul(10i128.checked_pow((scale - self.scale) as u32)?)
+    }
+
+    /// Returns `self + other`, exactly, or `None` on overflow.
+    pub fn checked_add(self, other: Decimal) -> Option<Decimal> {
+        let scale = self.scale.max(other.scale);
+        Decimal::new(self.units_at(scale)?.checked_add(other.units_at(scale)?)?, scale)
+    }
+
+    /// Returns `self − other`, exactly, or `None` on overflow.
+    pub fn checked_sub(self, other: Decimal) -> Option<Decimal> {
+        let scale = self.scale.max(other.scale);
+        Decimal::new(self.units_at(scale)?.checked_sub(other.units_at(scale)?)?, scale)
+    }
+
+    // (integer part, fraction scaled to 38 digits), both with the sign of
+    // the number. The pair orders numbers exactly, with no overflow.
+    fn parts(self) -> (i128, i128) {
+        let p = 10i128.pow(self.scale as u32);
+        (self.units / p, (self.units % p) * 10i128.pow((MAX_DECIMAL_SCALE - self.scale) as u32))
+    }
+}
+
+impl PartialOrd for Decimal {
+    fn partial_cmp(&self, other: &Decimal) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Numeric order.
+impl Ord for Decimal {
+    fn cmp(&self, other: &Decimal) -> Ordering {
+        self.parts().cmp(&other.parts())
+    }
 }
 
 impl fmt::Display for Decimal {
@@ -543,6 +580,21 @@ mod tests {
         for bad in ["", "-", "1.", ".5", "1.2.3", "1e5", "+1", "１"] {
             assert!(bad.parse::<Decimal>().is_err(), "{bad:?} parsed");
         }
+    }
+
+    #[test]
+    fn decimal_arithmetic_and_order() {
+        assert_eq!(dec("0.10").checked_add(dec("0.05")), Some(dec("0.15")));
+        assert_eq!(dec("800").checked_add(dec("-150")).unwrap().checked_add(dec("-100")), Some(dec("550")));
+        assert_eq!(dec("1.5").checked_sub(dec("2.25")), Some(dec("-0.75")));
+        assert_eq!(Decimal::new(i128::MAX, 0).unwrap().checked_add(dec("1")), None);
+        let mut v: Vec<Decimal> =
+            ["-1.5", "-1.2", "0", "0.5", "-0.5", "10", "9.99", "-10"].iter().map(|s| dec(s)).collect();
+        v.sort();
+        let sorted: Vec<String> = v.iter().map(|d| d.to_string()).collect();
+        assert_eq!(sorted, ["-10", "-1.5", "-1.2", "-0.5", "0", "0.5", "9.99", "10"]);
+        let big = Decimal::new(i128::MAX, 38).unwrap();
+        assert!(big > dec("1.7") && big < dec("1.71"));
     }
 
     #[test]

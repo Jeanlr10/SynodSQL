@@ -44,6 +44,8 @@ jobs:
     env:
       SYNOD_SIM_RUNS: 300
       PROPTEST_CASES: 2000
+      # Phase 2 exit gate: 100,000 random merge histories.
+      SYNOD_MERGE_RUNS: 100000
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

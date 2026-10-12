@@ -132,7 +132,7 @@ fn foreign_keys_and_defaults() {
     t.commit().unwrap();
     assert_eq!(s.query("SELECT count(*) FROM note", &[]).unwrap(), vec![vec![Sql::Integer(0)]]);
     let tables: Vec<u32> = s.all_entries().unwrap().iter().filter(|e| e.op == Op::Delete).map(|e| e.table).collect();
-    assert_eq!(tables, [2, 1, 0], "orders, then the cascaded note, then customer");
+    assert_eq!(tables, [3, 2, 1], "orders, then the cascaded note, then customer (table 0 is _conflicts)");
 }
 
 #[test]
@@ -206,7 +206,7 @@ fn reopen_keeps_state_and_clock() {
     // The physical clock goes backward over the restart.
     n.clock.set(START_MS - 10_000);
     let mut s = n.open().unwrap();
-    assert_eq!(s.tables().len(), 1);
+    assert_eq!(s.tables().len(), 2, "_conflicts and inventory");
     let mut t = s.begin().unwrap();
     assert!(t.hlc() > c.hlc, "the HLC must not go backward across a restart");
     let b = t.insert("inventory", &part("B", 1)).unwrap();

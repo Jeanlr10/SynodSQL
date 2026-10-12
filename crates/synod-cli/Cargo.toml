@@ -1,0 +1,20 @@
+[package]
+name = "synod-cli"
+description = "The synod command: a SynodSQL node store and offline file sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "synod"
+path = "src/main.rs"
+
+[dependencies]
+synod-core.workspace = true
+synod-store = { path = "../synod-store" }
+rusqlite.workspace = true
+
+[lints]
+workspace = true

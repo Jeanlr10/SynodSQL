@@ -331,6 +331,16 @@ impl CrashFs {
         self.shared().lock().live_names.keys().cloned().collect()
     }
 
+    /// Writes a whole file, durably, as a copy from another machine would.
+    /// It replaces a file of the same name.
+    pub fn write_file(&self, path: &str, data: &[u8]) {
+        let mut s = self.shared().lock();
+        let ino = s.inodes.len();
+        s.inodes.push(Inode { durable: data.to_vec(), live: data.to_vec(), ..Inode::default() });
+        s.live_names.insert(path.to_owned(), ino);
+        s.durable_names.insert(path.to_owned(), ino);
+    }
+
     /// Returns the content of a file as the process sees it.
     pub fn read(&self, path: &str) -> Option<Vec<u8>> {
         let s = self.shared().lock();

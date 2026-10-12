@@ -10,11 +10,11 @@ repository.workspace = true
 [dependencies]
 synod-core.workspace = true
 rusqlite.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 synod-sim.workspace = true
 proptest.workspace = true
-blake3.workspace = true
 
 [lints]
 workspace = true

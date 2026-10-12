@@ -18,6 +18,6 @@ pub mod sqlite;
 
 pub use disk::Disk;
 pub use rng::SimRng;
-pub use seeds::check_seeds;
+pub use seeds::{check_seeds, check_seeds_with};
 pub use sim::{ClockConfig, Config, Ctx, FaultConfig, NetConfig, Node, NodeIndex, Sim, Stats};
 pub use sqlite::CrashFs;

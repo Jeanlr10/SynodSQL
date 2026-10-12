@@ -191,7 +191,7 @@ fn entry(
     before: Option<Vec<Value>>,
     after: Option<Vec<Value>>,
 ) -> LogEntry {
-    LogEntry { op, table: 0, row_id, txn, hlc, before, after }
+    LogEntry { op, table: 1, row_id, txn, hlc, before, after }
 }
 
 /// Checks the reopened store against the model, or against the model with

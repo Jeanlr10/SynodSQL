@@ -11,7 +11,10 @@
 //! | `_synod_log` | one entry per write, in commit order |
 //! | `_synod_sealed` | sealed logs and their hashes |
 //! | `_synod_rowhash` | row hash of every row, for the state hash |
-//! | `_synod_dirty` | rows written by [`Txn::put_row`] since the last state hash |
+//! | `_synod_dirty` | rows written outside the log since the last state hash |
+//! | `_synod_undo` | the base-state version of each row changed since the last merge |
+//! | `_synod_merged`, `_synod_merged_log` | merged epochs, their manifests and roots |
+//! | `_conflicts` (managed table 0) | conflicts that merges recorded |
 //!
 //! A write changes its row, its log entry, and the counters in one SQLite
 //! transaction. So a committed write is in the log exactly once, and a
@@ -27,11 +30,11 @@ use synod_core::{Cell, Hlc, HlcClock, LogEntry, NodeId, Op, Row, RowHash, RowId,
 
 use crate::env::Env;
 use crate::error::{Error, Result};
-use crate::schema::{TableSchema, parse_create_table};
+use crate::schema::{TableSchema, parse_create_table, parse_system_table};
 use crate::values;
 
 /// Version of the store file layout.
-pub const STORE_FORMAT: i64 = 1;
+pub const STORE_FORMAT: i64 = 2;
 
 const SETUP: &str = "
 CREATE TABLE _synod_node (
@@ -46,7 +49,9 @@ CREATE TABLE _synod_node (
     hlc_last INTEGER NOT NULL,
     open_epoch INTEGER NOT NULL,
     base_root BLOB NOT NULL,
-    hashed_seq INTEGER NOT NULL
+    hashed_seq INTEGER NOT NULL,
+    first_epoch INTEGER NOT NULL,
+    merged_epoch INTEGER
 ) STRICT;
 CREATE TABLE _synod_schema (
     table_id INTEGER PRIMARY KEY,
@@ -75,6 +80,23 @@ CREATE TABLE _synod_rowhash (
 CREATE TABLE _synod_dirty (
     row_id BLOB PRIMARY KEY,
     tbl INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE TABLE _synod_undo (
+    row_id BLOB PRIMARY KEY,
+    tbl INTEGER NOT NULL,
+    row BLOB
+) STRICT, WITHOUT ROWID;
+CREATE TABLE _synod_merged (
+    epoch INTEGER PRIMARY KEY,
+    manifest BLOB NOT NULL,
+    root BLOB NOT NULL,
+    conflicts INTEGER NOT NULL
+) STRICT;
+CREATE TABLE _synod_merged_log (
+    log_hash BLOB PRIMARY KEY,
+    merged_in INTEGER NOT NULL,
+    node INTEGER NOT NULL,
+    log_epoch INTEGER NOT NULL
 ) STRICT, WITHOUT ROWID;
 ";
 
@@ -119,15 +141,15 @@ pub struct Commit {
 
 /// A SynodSQL node store on SQLite.
 pub struct Store {
-    conn: Connection,
-    path: String,
-    env: Env,
-    config: StoreConfig,
-    clock: HlcClock,
-    tables: Vec<Arc<TableSchema>>,
+    pub(crate) conn: Connection,
+    pub(crate) path: String,
+    pub(crate) env: Env,
+    pub(crate) config: StoreConfig,
+    pub(crate) clock: HlcClock,
+    pub(crate) tables: Vec<Arc<TableSchema>>,
 }
 
-fn sql_err(e: rusqlite::Error) -> Error {
+pub(crate) fn sql_err(e: rusqlite::Error) -> Error {
     match &e {
         rusqlite::Error::SqliteFailure(f, msg) if f.code == ErrorCode::ConstraintViolation => {
             Error::Constraint(msg.clone().unwrap_or_else(|| e.to_string()))
@@ -136,7 +158,7 @@ fn sql_err(e: rusqlite::Error) -> Error {
     }
 }
 
-fn hlc_at(ms: u64) -> Result<Hlc> {
+pub(crate) fn hlc_at(ms: u64) -> Result<Hlc> {
     Hlc::new(ms, 0).ok_or(Error::Clock(synod_core::HlcError::Overflow))
 }
 
@@ -147,6 +169,9 @@ impl Store {
     pub fn open(path: &str, config: StoreConfig, env: Env) -> Result<Store> {
         if config.epoch_len_ms == 0 {
             return Err(Error::Invalid("epoch length must be at least 1 ms".into()));
+        }
+        if config.node == crate::merge::MERGE_NODE {
+            return Err(Error::Invalid(format!("node ID {} is reserved for the merge", config.node)));
         }
         // A leftover from a base switch that did not finish.
         let next = format!("{path}.next");
@@ -175,7 +200,7 @@ impl Store {
             let open_epoch = now.saturating_sub(config.genesis_ms) / config.epoch_len_ms;
             conn.execute_batch(&format!("BEGIN IMMEDIATE; {SETUP}"))?;
             conn.execute(
-                "INSERT INTO _synod_node VALUES (0, ?1, ?2, ?3, ?4, ?5, 0, 0, 0, ?6, ?7, 0)",
+                "INSERT INTO _synod_node VALUES (0, ?1, ?2, ?3, ?4, ?5, 0, 0, 0, ?6, ?7, 0, ?6, NULL)",
                 params![
                     STORE_FORMAT,
                     config.node.0,
@@ -216,7 +241,8 @@ impl Store {
                 if id as usize != tables.len() {
                     return Err(Error::Corrupt(format!("table IDs are not 0, 1, 2, ...: found {id}")));
                 }
-                tables.push(Arc::new(parse_create_table(&ddl, id)?));
+                let schema = if id == 0 { parse_system_table(&ddl, 0)? } else { parse_create_table(&ddl, id)? };
+                tables.push(Arc::new(schema));
             }
         }
 
@@ -224,7 +250,40 @@ impl Store {
         // a sealed epoch (specification Section 3.4).
         let epoch_start = hlc_at(config.genesis_ms + open_epoch as u64 * config.epoch_len_ms)?;
         let clock = HlcClock::resume(Hlc::from_u64(hlc_last as u64).max(epoch_start), config.max_drift_ms);
-        Ok(Store { conn, path: path.to_owned(), env, config, clock, tables })
+        let mut store = Store { conn, path: path.to_owned(), env, config, clock, tables };
+        if store.tables.is_empty() {
+            store.add_table(parse_system_table(crate::merge::CONFLICTS_DDL, 0)?)?;
+        }
+        Ok(store)
+    }
+
+    /// Opens an existing store with the settings stored in it.
+    pub fn open_existing(path: &str, env: Env) -> Result<Store> {
+        if !env.fs.exists(path)? {
+            return Err(Error::Invalid(format!("no store at {path}")));
+        }
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = match env.fs.vfs() {
+            Some(vfs) => Connection::open_with_flags_and_vfs(path, flags, vfs)?,
+            None => Connection::open_with_flags(path, flags)?,
+        };
+        let config = conn
+            .query_row("SELECT node, genesis_ms, epoch_len_ms, max_drift_ms FROM _synod_node", [], |r| {
+                Ok(StoreConfig {
+                    node: NodeId(r.get(0)?),
+                    genesis_ms: r.get::<_, i64>(1)? as u64,
+                    epoch_len_ms: r.get::<_, i64>(2)? as u64,
+                    max_drift_ms: r.get::<_, i64>(3)? as u64,
+                })
+            })
+            .map_err(|e| Error::Invalid(format!("{path} is not a SynodSQL store: {e}")))?;
+        conn.close().map_err(|(_, e)| Error::Sql(e))?;
+        Store::open(path, config, env)
+    }
+
+    /// Returns the local physical clock, in milliseconds.
+    pub fn now_ms(&self) -> u64 {
+        self.env.clock.now_ms()
     }
 
     /// Returns the settings.
@@ -274,7 +333,10 @@ impl Store {
 
     /// Adds a managed table. See [`crate::schema`] for the language.
     pub fn create_table(&mut self, ddl: &str) -> Result<Arc<TableSchema>> {
-        let schema = parse_create_table(ddl, self.tables.len() as u32)?;
+        self.add_table(parse_create_table(ddl, self.tables.len() as u32)?)
+    }
+
+    fn add_table(&mut self, schema: TableSchema) -> Result<Arc<TableSchema>> {
         if self.tables.iter().any(|t| t.name.eq_ignore_ascii_case(&schema.name)) {
             return Err(Error::Schema(format!("table {} exists", schema.name)));
         }
@@ -350,6 +412,15 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// As [`query`](Store::query), and also returns the column names.
+    pub fn query_named(&self, sql: &str, params: &[Value]) -> Result<(Vec<String>, Vec<Vec<SqlValue>>)> {
+        let names = {
+            let stmt = self.conn.prepare(sql)?;
+            stmt.column_names().into_iter().map(str::to_owned).collect()
+        };
+        Ok((names, self.query(sql, params)?))
+    }
+
     /// Returns the values of a live row.
     pub fn get(&self, table: &str, row_id: RowId) -> Result<Option<Vec<Value>>> {
         let schema = self.table(table)?;
@@ -422,6 +493,7 @@ impl Store {
                 epoch,
                 base_root: base_root.try_into().map_err(|_| Error::Corrupt("base_root".into()))?,
                 schema_epoch: 0,
+                schema_hash: crate::schema::schema_hash(s.tables.iter().map(|t| &**t)),
                 sealed_at,
             };
             let bodies: Vec<Vec<u8>> = {
@@ -467,7 +539,7 @@ impl Store {
 
     // Updates the row hash of every row that a log entry touched since the
     // last update, then builds the tree. Runs inside a transaction.
-    fn refresh_state_hash(&mut self) -> Result<NodeHash> {
+    pub(crate) fn refresh_state_hash(&mut self) -> Result<NodeHash> {
         let hashed: i64 = self.conn.query_row("SELECT hashed_seq FROM _synod_node", [], |r| r.get(0))?;
         let touched: Vec<(u32, Vec<u8>, i64)> = {
             let mut stmt = self.conn.prepare(
@@ -479,12 +551,14 @@ impl Store {
         let mut max_seq = hashed;
         for (tbl, id, seq) in touched {
             let schema = self.tables.get(tbl as usize).ok_or_else(|| Error::Corrupt(format!("table ID {tbl}")))?;
-            let row = read_row(&self.conn, schema, parse_row_id(&id)?)?
-                .ok_or_else(|| Error::Corrupt("a logged row is missing".into()))?;
-            self.conn.execute(
-                "INSERT OR REPLACE INTO _synod_rowhash (row_id, hash) VALUES (?1, ?2)",
-                params![id, row.hash().0.to_vec()],
-            )?;
+            match read_row(&self.conn, schema, parse_row_id(&id)?)? {
+                Some(row) => self.conn.execute(
+                    "INSERT OR REPLACE INTO _synod_rowhash (row_id, hash) VALUES (?1, ?2)",
+                    params![id, row.hash().0.to_vec()],
+                )?,
+                // A restore of the base state removed it.
+                None => self.conn.execute("DELETE FROM _synod_rowhash WHERE row_id = ?1", [id])?,
+            };
             max_seq = max_seq.max(seq);
         }
         self.conn.execute("UPDATE _synod_node SET hashed_seq = ?1", [max_seq])?;
@@ -501,7 +575,7 @@ impl Store {
         Ok(builder.finish())
     }
 
-    fn in_txn<T>(&mut self, f: impl FnOnce(&mut Store) -> Result<T>) -> Result<T> {
+    pub(crate) fn in_txn<T>(&mut self, f: impl FnOnce(&mut Store) -> Result<T>) -> Result<T> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         match f(self) {
             Ok(v) => {
@@ -536,25 +610,13 @@ impl Store {
 
     /// Closes the store and replaces its file with `next`, which must be a
     /// complete store file. Returns the store opened on the new file.
-    pub fn install(self, next: &str) -> Result<Store> {
-        let Store { conn, path, env, config, .. } = self;
-        env.fs.sync_file(next)?;
-        conn.close().map_err(|(_, e)| Error::Sql(e))?;
-        // A clean close checkpoints and deletes the WAL. A WAL that is left
-        // would be replayed onto the new file, so stop here.
-        let wal = format!("{path}-wal");
-        if env.fs.exists(&wal)? {
-            return Err(Error::Invalid(format!("{wal} still exists after close")));
-        }
-        // Make the WAL delete durable before the rename.
-        env.fs.sync_dir(&path)?;
-        env.fs.rename(next, &path)?;
-        env.fs.sync_dir(&path)?;
-        Store::open(&path, config, env)
+    pub fn install(mut self, next: &str) -> Result<Store> {
+        self.switch_to(next)?;
+        Ok(self)
     }
 }
 
-fn parse_row_id(bytes: &[u8]) -> Result<RowId> {
+pub(crate) fn parse_row_id(bytes: &[u8]) -> Result<RowId> {
     bytes.try_into().ok().and_then(RowId::from_be_bytes).ok_or_else(|| Error::Corrupt(format!("bad row ID {bytes:?}")))
 }
 
@@ -615,11 +677,27 @@ fn decode_stamps(bytes: &[u8], columns: usize) -> Option<Vec<Stamp>> {
         .collect()
 }
 
+/// Keeps the base-state version of a row before its first change since the
+/// last merge (`None`: the row is not in the base state). The merge restores
+/// these versions to get M(e−1) back.
+pub(crate) fn record_undo(conn: &Connection, table: u32, row_id: RowId, base: Option<&Row>) -> Result<()> {
+    conn.prepare_cached("INSERT OR IGNORE INTO _synod_undo (row_id, tbl, row) VALUES (?1, ?2, ?3)")?
+        .execute(params![row_id.to_be_bytes().to_vec(), table, base.map(Row::to_canonical_bytes)])?;
+    Ok(())
+}
+
+/// Marks a row for the next state hash refresh.
+pub(crate) fn mark_dirty(conn: &Connection, table: u32, row_id: RowId) -> Result<()> {
+    conn.prepare_cached("INSERT OR REPLACE INTO _synod_dirty (row_id, tbl) VALUES (?1, ?2)")?
+        .execute(params![row_id.to_be_bytes().to_vec(), table])?;
+    Ok(())
+}
+
 fn row_values(row: &Row) -> Vec<Value> {
     row.cells.iter().map(|c| c.value.clone()).collect()
 }
 
-fn read_row(conn: &Connection, schema: &TableSchema, row_id: RowId) -> Result<Option<Row>> {
+pub(crate) fn read_row(conn: &Connection, schema: &TableSchema, row_id: RowId) -> Result<Option<Row>> {
     let cols: Vec<String> = schema.columns.iter().map(|c| format!(", \"{}\"", c.name)).collect();
     let sql =
         format!("SELECT \"_tomb\", \"_stamps\"{} FROM \"{}\" WHERE \"_row_id\" = ?1", cols.concat(), schema.physical());
@@ -636,7 +714,7 @@ fn read_row(conn: &Connection, schema: &TableSchema, row_id: RowId) -> Result<Op
     Ok(Some(Row { row_id, tombstone: tombstone != 0, cells }))
 }
 
-fn write_row(conn: &Connection, schema: &TableSchema, row: &Row) -> Result<()> {
+pub(crate) fn write_row(conn: &Connection, schema: &TableSchema, row: &Row) -> Result<()> {
     let names: Vec<String> = schema.columns.iter().map(|c| format!(", \"{}\"", c.name)).collect();
     let marks: Vec<String> = (0..schema.columns.len()).map(|i| format!(", ?{}", i + 4)).collect();
     let sets: Vec<String> = schema.columns.iter().map(|c| format!(", \"{0}\" = excluded.\"{0}\"", c.name)).collect();
@@ -732,6 +810,7 @@ impl Txn<'_> {
             let row_id = RowId::new(t.txn.node, t.next_row);
             t.next_row = t.next_row.checked_add(1).ok_or_else(|| Error::Invalid("row counter exhausted".into()))?;
             let row = Row { row_id, tombstone: false, cells };
+            record_undo(&t.store.conn, schema.id, row_id, None)?;
             write_row(&t.store.conn, &schema, &row)?;
             t.check_row(&schema, row_id)?;
             t.check_parents(&schema, &row, None)?;
@@ -757,6 +836,7 @@ impl Txn<'_> {
                 after.cells[i] = Cell { stamp: self.stamp(), value };
             }
         }
+        record_undo(&self.store.conn, schema.id, row_id, Some(&before))?;
         write_row(&self.store.conn, schema, &after)?;
         self.check_row(schema, row_id)?;
         self.check_parents(schema, &after, Some(&before))?;
@@ -776,6 +856,7 @@ impl Txn<'_> {
         let before = self.live_row(schema, row_id)?;
         let mut after = before.clone();
         after.tombstone = true;
+        record_undo(&self.store.conn, schema.id, row_id, Some(&before))?;
         write_row(&self.store.conn, schema, &after)?;
         self.check_children(schema, &before, None)?;
         self.log(Op::Delete, schema, row_id, Some(row_values(&before)), None)
@@ -853,11 +934,10 @@ impl Txn<'_> {
                     )));
                 }
             }
+            let before = read_row(&t.store.conn, &schema, row.row_id)?;
+            record_undo(&t.store.conn, schema.id, row.row_id, before.as_ref())?;
             write_row(&t.store.conn, &schema, row)?;
-            t.store.conn.execute(
-                "INSERT OR REPLACE INTO _synod_dirty (row_id, tbl) VALUES (?1, ?2)",
-                params![row.row_id.to_be_bytes().to_vec(), schema.id],
-            )?;
+            mark_dirty(&t.store.conn, schema.id, row.row_id)?;
             // Never give out an ID that an imported row of this node holds.
             if row.row_id.node() == t.txn.node && row.row_id.counter() >= t.next_row {
                 t.next_row = row.row_id.counter().checked_add(1).ok_or_else(|| Error::Invalid("row counter".into()))?;

@@ -515,6 +515,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "synod-cli"
+version = "0.0.1"
+dependencies = [
+ "rusqlite",
+ "synod-core",
+ "synod-store",
+]
+
+[[package]]
 name = "synod-core"
 version = "0.0.1"
 dependencies = [

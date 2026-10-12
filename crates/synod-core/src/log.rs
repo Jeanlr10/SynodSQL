@@ -236,6 +236,9 @@ pub struct LogHeader {
     pub base_root: [u8; 32],
     /// Schema epoch.
     pub schema_epoch: u64,
+    /// Hash of the schema the entries were written under. A merge rejects
+    /// a log with another schema.
+    pub schema_hash: [u8; 32],
     /// HLC time of the seal.
     pub sealed_at: Hlc,
 }
@@ -250,6 +253,7 @@ pub fn encode_log<'a>(header: &LogHeader, bodies: impl ExactSizeIterator<Item = 
     out.extend_from_slice(&header.epoch.to_be_bytes());
     out.extend_from_slice(&header.base_root);
     out.extend_from_slice(&header.schema_epoch.to_be_bytes());
+    out.extend_from_slice(&header.schema_hash);
     out.extend_from_slice(&(bodies.len() as u64).to_be_bytes());
     out.extend_from_slice(&header.sealed_at.to_be_bytes());
     for body in bodies {
@@ -270,6 +274,7 @@ pub fn decode_log(bytes: &[u8]) -> Result<(LogHeader, Vec<LogEntry>), LogError> 
     let epoch = r.u64()?;
     let base_root = r.array()?;
     let schema_epoch = r.u64()?;
+    let schema_hash = r.array()?;
     let count = r.u64()?;
     let sealed_at = Hlc::from_u64(r.u64()?);
     let mut entries = Vec::new();
@@ -278,7 +283,7 @@ pub fn decode_log(bytes: &[u8]) -> Result<(LogHeader, Vec<LogEntry>), LogError> 
         entries.push(LogEntry::decode(r.take(len)?)?);
     }
     r.finish()?;
-    Ok((LogHeader { node, epoch, base_root, schema_epoch, sealed_at }, entries))
+    Ok((LogHeader { node, epoch, base_root, schema_epoch, schema_hash, sealed_at }, entries))
 }
 
 /// Returns the hash of a sealed log.
@@ -324,6 +329,7 @@ mod tests {
             epoch: 12,
             base_root: [9; 32],
             schema_epoch: 0,
+            schema_hash: [7; 32],
             sealed_at: Hlc::new(5_000, 0).unwrap(),
         };
         let bodies: Vec<Vec<u8>> = [Op::Insert, Op::Update, Op::Delete].map(|op| entry(op).encode()).to_vec();

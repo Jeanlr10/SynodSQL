@@ -32,26 +32,47 @@ Read the [white paper](docs/whitepaper.pdf) for the full model, and the [roadmap
 
 ## Status
 
-**Phase 1 (single-node core on SQLite) is done.** One node records every write in a form that the merge can use. There is no merge and no network yet. Phase 2 (the deterministic merge) is next.
+**Phase 2 (the deterministic merge) is done.** Nodes sync by files: each node seals its epoch, exports its log, and merges the logs of the others. Every node gets the same state, the same conflicts, and the same root hash. There is no network sync yet; Phase 3 (sync and multi-node operation) is next.
+
+```sh
+synod init a.db --node 10 --epoch-ms 60000
+synod create-table a.db "CREATE TABLE stock (row_id ROWID, sku TEXT UNIQUE, qty INTEGER MERGE delta)"
+synod insert a.db stock sku=A-100 qty=800
+# ... at the end of the epoch:
+synod seal a.db && synod merge a.db
+synod clone a.db b.db --node 11            # a second node from a's base state
+
+# Each node writes, seals, and exports its log for epoch 1.
+synod seal a.db && synod export a.db 1 a-1.log
+synod seal b.db && synod export b.db 1 b-1.log
+
+# Swap the files by any means, then merge. Both print the same root.
+synod merge a.db b-1.log
+synod merge b.db a-1.log
+synod conflicts a.db
+```
+
+In Rust, the same node is a `synod_store::Store`:
 
 ```rust
 let mut store = Store::open("node.db", config, Env::os())?;
 store.create_table("CREATE TABLE stock (sku TEXT UNIQUE, qty INTEGER CHECK (qty >= 0) MERGE delta)")?;
 
-let mut txn = store.begin()?;                       // one HLC time, one transaction ID
+let mut txn = store.begin()?;                      // one HLC time, one transaction ID
 let id = txn.insert("stock", &[("sku", Value::Text("A-100".into())), ("qty", Value::Integer(500))])?;
 txn.update("stock", id, &[("qty", Value::Integer(350))])?;
-txn.commit()?;                                      // rows, log entries, counters: one SQLite commit
+txn.commit()?;                                     // rows, log entries, counters: one SQLite commit
 
-store.query("SELECT sku, qty FROM stock", &[])?;    // a view; tombstones are hidden
-let sealed = store.seal()?;                         // at the epoch's end: log + hash + state hash
+store.seal()?;                                     // at the epoch's end
+let report = store.merge(epoch, &other_logs)?;     // M(e), conflicts, root hash
 ```
 
 | Part | Where |
 | --- | --- |
-| Specification v0.1: formats, schema language, log, state hash, merge rules | [`docs/spec/v0.1.md`](docs/spec/v0.1.md) |
+| Specification v0.1: formats, schema language, log, merge rules, state hash | [`docs/spec/v0.1.md`](docs/spec/v0.1.md) |
 | HLC, row IDs, canonical encoding, epoch log format, Prolly tree | [`crates/synod-core`](crates/synod-core) |
-| Store on SQLite: schema with `MERGE`, write API, seal, base switch | [`crates/synod-store`](crates/synod-store) |
+| Store on SQLite: schema with `MERGE`, write API, seal, merge, conflicts | [`crates/synod-store`](crates/synod-store) |
+| The `synod` command | [`crates/synod-cli`](crates/synod-cli) |
 | Deterministic simulator, and a SQLite VFS with crash injection | [`crates/synod-sim`](crates/synod-sim) |
 
 ## Build and test
@@ -70,11 +91,13 @@ SYNOD_SEED=1234 cargo test -- --exact log_is_exact_and_crashes_lose_nothing
 
 The crash tests run real SQLite on an in-memory disk that loses unsynced writes at a crash. They need no setup.
 
-To run more seeds or more property cases:
+To run more seeds, property cases, or merge histories:
 
 ```sh
-SYNOD_SIM_RUNS=1000 PROPTEST_CASES=10000 cargo test --workspace --release
+SYNOD_SIM_RUNS=1000 PROPTEST_CASES=10000 SYNOD_MERGE_RUNS=100000 cargo test --workspace --release
 ```
+
+To build the `synod` command: `cargo install --path crates/synod-cli`.
 
 ## Contributing
 

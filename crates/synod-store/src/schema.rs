@@ -184,12 +184,27 @@ pub struct TableSchema {
     pub foreign_keys: Vec<ForeignKey>,
     /// Delete rule.
     pub delete_rule: DeleteRule,
-    /// The statement this schema came from.
+    /// The schema as one canonical `CREATE TABLE` statement (see
+    /// [`TableSchema::canonical`]).
     pub ddl: String,
 }
 
 /// Prefix of the physical table that stores a managed table.
 pub const PHYSICAL_PREFIX: &str = "_synod_t_";
+
+/// Key-derivation context for schema hashes.
+pub const SCHEMA_HASH_CONTEXT: &str = "SynodSQL 2026-10-12 schema hash v1";
+
+/// Returns the hash of a schema: the canonical statements of all tables,
+/// in table ID order, each ended by a newline.
+pub fn schema_hash<'a>(tables: impl IntoIterator<Item = &'a TableSchema>) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key(SCHEMA_HASH_CONTEXT);
+    for t in tables {
+        h.update(t.canonical().as_bytes());
+        h.update(b"\n");
+    }
+    *h.finalize().as_bytes()
+}
 
 impl TableSchema {
     /// Returns the index of a column, by name (case-insensitive).
@@ -243,6 +258,46 @@ impl TableSchema {
             shown.join(", ")
         ));
         out
+    }
+
+    /// Returns the schema as a `CREATE TABLE` statement in one fixed form:
+    /// keywords in capitals, single spaces, the ROWID column first, then the
+    /// columns, unique keys, CHECKs, and foreign keys. Two statements that
+    /// declare the same table give the same text. Parsing the text gives
+    /// the same schema.
+    pub fn canonical(&self) -> String {
+        let mut items = Vec::new();
+        if let Some(r) = &self.row_id_column {
+            items.push(format!("{r} ROWID"));
+        }
+        for c in &self.columns {
+            let mut item = format!("{} {}", c.name, c.ty);
+            if c.not_null {
+                item.push_str(" NOT NULL");
+            }
+            if let Some(d) = &c.default {
+                item.push_str(&format!(" DEFAULT {d}"));
+            }
+            item.push_str(&format!(" MERGE {}", c.merge));
+            items.push(item);
+        }
+        for u in &self.uniques {
+            let names: Vec<&str> = u.iter().map(|&i| self.columns[i].name.as_str()).collect();
+            items.push(format!("UNIQUE ({})", names.join(", ")));
+        }
+        for c in &self.checks {
+            items.push(format!("CHECK ({c})"));
+        }
+        for fk in &self.foreign_keys {
+            items.push(format!(
+                "FOREIGN KEY ({}) REFERENCES {} ({}){}",
+                self.columns[fk.column].name,
+                fk.parent,
+                fk.parent_column,
+                if fk.cascade { " ON DELETE CASCADE" } else { "" }
+            ));
+        }
+        format!("CREATE TABLE {} ({}) MERGE DELETE {}", self.name, items.join(", "), self.delete_rule)
     }
 
     fn quoted(&self, cols: &[usize]) -> String {
@@ -499,11 +554,23 @@ struct Builder {
 
 /// Parses a `CREATE TABLE` statement. `id` becomes the table ID.
 pub fn parse_create_table(ddl: &str, id: u32) -> Result<TableSchema> {
+    parse(ddl, id, false)
+}
+
+/// Parses a table that the store itself makes, such as `_conflicts`.
+pub(crate) fn parse_system_table(ddl: &str, id: u32) -> Result<TableSchema> {
+    parse(ddl, id, true)
+}
+
+fn parse(ddl: &str, id: u32, system: bool) -> Result<TableSchema> {
     let mut p = Parser { src: ddl, toks: lex(ddl)?, pos: 0 };
     p.expect_kw("CREATE")?;
     p.expect_kw("TABLE")?;
     let name = p.ident("table name")?;
     check_name(&name, "table")?;
+    if !system && name.eq_ignore_ascii_case(crate::merge::CONFLICTS_TABLE) {
+        return Err(schema_err(format!("table name {name} is reserved")));
+    }
     p.expect_punct('(')?;
     let mut b = Builder {
         columns: Vec::new(),
@@ -530,7 +597,7 @@ pub fn parse_create_table(ddl: &str, id: u32) -> Result<TableSchema> {
     if p.peek().is_some() {
         return Err(p.unexpected("end of statement"));
     }
-    finish(b, id, name, delete_rule, ddl.trim().to_owned())
+    finish(b, id, name, delete_rule)
 }
 
 fn parse_item(p: &mut Parser<'_>, b: &mut Builder) -> Result<()> {
@@ -654,7 +721,7 @@ fn check_name(name: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
-fn finish(b: Builder, id: u32, name: String, delete_rule: DeleteRule, ddl: String) -> Result<TableSchema> {
+fn finish(b: Builder, id: u32, name: String, delete_rule: DeleteRule) -> Result<TableSchema> {
     let mut columns = b.columns;
     if columns.is_empty() {
         return Err(schema_err("a table needs at least one column"));
@@ -699,7 +766,7 @@ fn finish(b: Builder, id: u32, name: String, delete_rule: DeleteRule, ddl: Strin
     for i in not_null {
         columns[i].not_null = true;
     }
-    Ok(TableSchema {
+    let mut table = TableSchema {
         id,
         name,
         row_id_column: b.row_id_column,
@@ -708,8 +775,10 @@ fn finish(b: Builder, id: u32, name: String, delete_rule: DeleteRule, ddl: Strin
         checks: b.checks,
         foreign_keys,
         delete_rule,
-        ddl,
-    })
+        ddl: String::new(),
+    };
+    table.ddl = table.canonical();
+    Ok(table)
 }
 
 #[cfg(test)]
@@ -775,6 +844,22 @@ mod tests {
         assert_eq!(t.columns[3].merge, MergePolicy::Max);
         assert_eq!(t.checks, vec!["total > 0 OR note IS NOT NULL"]);
         assert_eq!(t.delete_rule, DeleteRule::UpdateWins);
+    }
+
+    #[test]
+    fn canonical_form_round_trips() {
+        let a = parse_create_table(INVENTORY, 3).unwrap();
+        let b = parse_create_table(&a.ddl, 3).unwrap();
+        assert_eq!(a, b);
+        let messy = parse_create_table(
+            "create   table inventory(row_id rowid, sku text unique merge lww, name text, price decimal(10,2) merge lww_flag,
+             qty int check (qty >= 0) merge delta, tags set<text> merge union, notes text merge text3)",
+            3,
+        )
+        .unwrap();
+        assert_eq!(messy.ddl, a.ddl);
+        assert!(a.ddl.starts_with("CREATE TABLE inventory (row_id ROWID, sku TEXT MERGE lww,"), "{}", a.ddl);
+        assert!(parse_create_table("CREATE TABLE _conflicts (a TEXT)", 1).is_err());
     }
 
     #[test]

@@ -10,8 +10,8 @@ SynodSQL ships in six phases, and each phase ends with a measurable gate. Phases
 | --- | --- | --- |
 | 0. Foundations | Formats, HLC, row IDs, simulator, CI | **Done** |
 | 1. Single-node core on SQLite | Record every write in a form the merge can use | **Done** |
-| 2. Deterministic merge | `M(e) = merge(M(e−1), logs)`; offline file sync | Next |
-| 3. Sync and multi-node operation | Automatic epochs over a network | |
+| 2. Deterministic merge | `M(e) = merge(M(e−1), logs)`; offline file sync | **Done** |
+| 3. Sync and multi-node operation | Automatic epochs over a network | Next |
 | 4. Custom storage engine | Only if Phase 3 benchmarks show SQLite is the bottleneck | Conditional |
 | 5. Hot indexes and hardening | Read optimizations and long-lived deployments | |
 
@@ -104,14 +104,14 @@ Build a pure merge function that turns M(e−1) and N logs into one M(e), the sa
 
 **Deliverables:**
 
-- [ ] Per-row merge, column by column (white paper, Section 6.1)
-- [ ] Column policies: lww, lww\_flag, delta, max, min, union, text3, flag
-- [ ] Delete rules: delete wins, update wins, flag
-- [ ] Constraint pass: unique keys (earliest insert wins), foreign keys (undo the delete), check constraints (record)
-- [ ] \_conflicts table with a deterministic conflict\_id
-- [ ] Late-log handling with each entry's own before-image and HLC time
-- [ ] Offline command: `synod merge base.db logs/*.log`
-- [ ] Two-node file sync: export a log, copy it by any means, import it, merge
+- [x] Per-row merge, column by column (white paper, Section 6.1) — `synod-store/src/merge/`, [spec 7.1](spec/v0.1.md)
+- [x] Column policies: lww, lww\_flag, delta, max, min, union, text3, flag — `merge/policy.rs`, `merge/text3.rs`
+- [x] Delete rules: delete wins, update wins, flag
+- [x] Constraint pass: unique keys (earliest insert wins), foreign keys (undo the delete), check constraints (record) — `merge/constraints.rs`
+- [x] \_conflicts table with a deterministic conflict\_id — table 0 of every store, [spec 7.5](spec/v0.1.md)
+- [x] Late-log handling with each entry's own before-image and HLC time
+- [x] Offline command: `synod merge base.db logs/*.log` — `crates/synod-cli`
+- [x] Two-node file sync: export a log, copy it by any means, import it, merge — `synod export`, `synod merge`, and `synod clone` for a new node
 
 **Exit gate:**
 
@@ -119,6 +119,17 @@ Build a pure merge function that turns M(e−1) and N logs into one M(e), the sa
 2. The worked example in the white paper gives exactly its published result.
 
 **Main risk:** hidden nondeterminism. Hash map iteration order, float sums, and locale-dependent text comparison can all change the result between machines. Use sorted iteration, decimal or integer types, and byte-wise comparison inside the merge.
+
+**Gate result:** met.
+
+1. `synod-store/tests/determinism.rs` runs 100,000 random histories in CI (1,000 by default): 2 to 10 nodes with random IDs, 1 to 3 epochs, late logs, two tables with every policy, a random delete rule and CASCADE. Each epoch merges with the logs in five orders, on separate copies of the base; all outputs (rows, `_conflicts` rows, root hash) are equal. The test also checks unique keys and foreign keys in every M(e), and that every kind of conflict and rule occurs. A run takes about 4 minutes in release mode.
+2. `synod-store/tests/merge.rs` runs the worked example on three stores at the white paper's HLC times. M(e) is Table VIII, `_conflicts` is Table IX (three rows), and the three nodes have one root hash.
+
+More tests: stores that write during the sync converge, and their M(e) equals the pure merge of the same logs (`tests/sync.rs`); a crash at each of the 94 disk operations of a merge leaves the old state (the merge then runs again to the same root) or the merged one; the command-line file sync works (`synod-cli/tests/cli.rs`).
+
+**Found by the gate:** at 100,000 histories, seed 8344 left a live child without a parent and without a conflict. A parent restored from M(e−1) gave up a key value that a new child used, and the next round did not look at that value. The constraint pass now keeps every row version that it replaces. A parent whose key changed now keeps the change, and the orphan child is recorded instead of undoing the parent's other columns.
+
+**Known limits, for the Phase 3 benchmarks:** the constraint pass scans the merged rows for each key lookup (cost Δ² in the number of changed rows), and the state hash rebuilds the tree in one pass over all rows.
 
 ## Phase 3: Sync and multi-node operation
 
