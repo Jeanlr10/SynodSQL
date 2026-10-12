@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/synod-core", "crates/synod-sim"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Jeanlr10/SynodSQL"
+
+[workspace.dependencies]
+synod-core = { path = "crates/synod-core" }
+blake3 = "1.8"
+proptest = "1.12"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
