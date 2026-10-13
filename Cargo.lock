@@ -983,6 +983,7 @@ name = "synod-node"
 version = "0.0.1"
 dependencies = [
  "blake3",
+ "rusqlite",
  "synod-core",
  "synod-sim",
  "synod-store",

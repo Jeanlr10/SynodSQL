@@ -69,6 +69,8 @@ pub struct Params {
     pub keys: u64,
     /// `Some`: the conflict model workload instead of random writes.
     pub model: Option<Model>,
+    /// The schema of the one table, `stock`.
+    pub schema: &'static str,
     pub sim: Config,
 }
 
@@ -118,6 +120,17 @@ pub struct Model {
     pub rows: usize,
     pub w: u32,
     pub dist: Dist,
+    /// Write after the merge of the previous epoch (4/5 into the epoch)
+    /// instead of at its start. A write at the start is in flight: it does
+    /// not see the other nodes' writes of the previous epoch.
+    pub after_merge: bool,
+}
+
+impl Model {
+    /// Writes after the merge, as the model assumes.
+    pub fn new(rows: usize, w: u32, dist: Dist) -> Model {
+        Model { rows, w, dist, after_merge: true }
+    }
 }
 
 /// What the oracle saw.
@@ -142,6 +155,8 @@ pub struct Oracle {
     pub conflicts_by_epoch: BTreeMap<(u64, [u8; 32]), usize>,
     /// Wall time in node code, by kind (ticks, and messages by name).
     pub time_ms: BTreeMap<&'static str, (u64, f64)>,
+    /// Messages sent, by kind: count and encoded bytes.
+    pub sent: BTreeMap<&'static str, (u64, u64)>,
 }
 
 pub struct SimNode {
@@ -217,9 +232,15 @@ impl SimNode {
 
     fn flush(&mut self, ctx: &mut Ctx<'_>) {
         let peer = self.peer.as_mut().unwrap();
+        let mut o = self.oracle.borrow_mut();
         for (to, msg) in peer.take_outbox() {
-            ctx.send(index_of(to), msg.encode());
+            let bytes = msg.encode();
+            let e = o.sent.entry(msg.name()).or_default();
+            e.0 += 1;
+            e.1 += bytes.len() as u64;
+            ctx.send(index_of(to), bytes);
         }
+        drop(o);
         self.record_events();
     }
 
@@ -387,7 +408,8 @@ impl Node for SimNode {
                 }
             }
             Some(m) => {
-                let epoch = ctx.now_ms().saturating_sub(START_MS) / self.params.epoch_ms;
+                let shift = if m.after_merge { self.params.epoch_ms * 4 / 5 } else { 0 };
+                let epoch = ctx.now_ms().saturating_sub(START_MS + shift) / self.params.epoch_ms;
                 if epoch > self.model_epoch && epoch < self.params.epochs {
                     self.model_epoch = epoch;
                     for _ in 0..m.w {
@@ -449,7 +471,7 @@ fn make_stores(params: &Params, seed: u64) -> Vec<Arc<CrashFs>> {
             lateness: params.lateness,
         };
         let mut s = Store::open(PATH, config, env).unwrap();
-        s.create_table(SCHEMA).unwrap();
+        s.create_table(params.schema).unwrap();
         let mut t = s.begin().unwrap();
         for k in 0..m.rows {
             t.insert("stock", &[("sku", Value::Text(format!("K-{k}"))), ("qty", Value::Integer(1_000_000))]).unwrap();
@@ -482,7 +504,7 @@ fn make_stores(params: &Params, seed: u64) -> Vec<Arc<CrashFs>> {
                 lateness: params.lateness,
             };
             let mut s = Store::open(PATH, config, env).unwrap();
-            s.create_table(SCHEMA).unwrap();
+            s.create_table(params.schema).unwrap();
             drop(s);
             for f in fs.list() {
                 let data = fs.read(&f).unwrap();
@@ -655,6 +677,7 @@ pub fn params(nodes: usize, epochs: u64) -> Params {
         write_per_million: 300_000,
         keys: 40,
         model: None,
+        schema: SCHEMA,
         sim,
     }
 }

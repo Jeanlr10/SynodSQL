@@ -168,7 +168,7 @@ fn conflict_counts_follow_the_model() {
         p.sim.faults.crash_interval_ms = None;
         p.sim.faults.partition_interval_ms = None;
         p.sim.net.loss_per_million = 0;
-        p.model = Some(Model { rows, w, dist });
+        p.model = Some(Model::new(rows, w, dist));
         let epochs = (p.epochs - 1) as f64;
         let r = run(7, p);
         r.check();

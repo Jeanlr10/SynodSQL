@@ -15,6 +15,7 @@ blake3.workspace = true
 [dev-dependencies]
 synod-store = { workspace = true, features = ["test-hooks"] }
 synod-sim.workspace = true
+rusqlite.workspace = true
 
 [lints]
 workspace = true
