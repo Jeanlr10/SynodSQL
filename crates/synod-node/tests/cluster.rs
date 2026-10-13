@@ -217,16 +217,16 @@ fn gate_params(nodes: usize, epochs: u64) -> Params {
     p
 }
 
-fn epochs_from_env(var: &str, default: u64) -> u64 {
+fn number_from_env(var: &str, default: u64) -> u64 {
     std::env::var(var).map_or(default, |v| v.parse().unwrap_or_else(|_| panic!("{var} is not a number")))
 }
 
-fn report(name: &str, r: &Run) {
+fn report(name: &str, seed: u64, r: &Run) {
     let o = r.oracle.borrow();
     let st = r.sim.stats();
     let m = |f: fn(&synod_node::Metrics) -> u64| (0..r.params.nodes).map(|i| f(r.peer(i).metrics())).sum::<u64>();
     eprintln!(
-        "{name}: {} nodes, {} epochs: {} merges ({} distinct), {} unmerges, {} catch-ups, {} repairs, \
+        "{name}, seed {seed}: {} nodes, {} epochs: {} merges ({} distinct), {} unmerges, {} catch-ups, {} repairs, \
          {} own logs given up, {} conflicts recorded, {} late logs; {} crashes ({} inside a disk write), \
          {} partitions, {} messages lost; root hash mismatches: {}",
         r.params.nodes,
@@ -249,18 +249,22 @@ fn report(name: &str, r: &Run) {
 
 /// Phase 3 gate 1: 5 nodes for SYNOD_GATE_EPOCHS epochs (10,000 in the CI
 /// simulation job). Nodes on the same manifest have one root hash, all
-/// nodes converge, and no committed write is lost.
+/// nodes converge, and no committed write is lost. SYNOD_GATE_SEED picks
+/// the seed (default 1); `scripts/gate.sh` runs many seeds in parallel.
 #[test]
 fn gate_five_nodes_long_run() {
-    let r = run(1, gate_params(5, epochs_from_env("SYNOD_GATE_EPOCHS", 300)));
+    let seed = number_from_env("SYNOD_GATE_SEED", 1);
+    let r = run(seed, gate_params(5, number_from_env("SYNOD_GATE_EPOCHS", 300)));
     r.check();
-    report("gate_five_nodes_long_run", &r);
+    report("gate_five_nodes_long_run", seed, &r);
 }
 
-/// Phase 3 gate 1 at 50 nodes, for SYNOD_GATE50_EPOCHS epochs.
+/// Phase 3 gate 1 at 50 nodes, for SYNOD_GATE50_EPOCHS epochs, with seed
+/// SYNOD_GATE_SEED (default 2).
 #[test]
 fn gate_fifty_nodes() {
-    let r = run(2, gate_params(50, epochs_from_env("SYNOD_GATE50_EPOCHS", 10)));
+    let seed = number_from_env("SYNOD_GATE_SEED", 2);
+    let r = run(seed, gate_params(50, number_from_env("SYNOD_GATE50_EPOCHS", 10)));
     r.check();
-    report("gate_fifty_nodes", &r);
+    report("gate_fifty_nodes", seed, &r);
 }
