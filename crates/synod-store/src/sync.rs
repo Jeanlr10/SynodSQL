@@ -21,7 +21,9 @@ use crate::merge::{
     given_up_id, merge, validate_log,
 };
 use crate::schema::{TableSchema, schema_hash};
-use crate::store::{Store, StoreConfig, Txn, hlc_at, mark_dirty, parse_row_id, read_row, record_undo, write_row};
+use crate::store::{
+    Store, StoreConfig, Txn, WrittenHashes, hlc_at, mark_dirty, parse_row_id, read_row, record_undo, write_row,
+};
 use crate::values;
 
 /// What a merge did.
@@ -426,8 +428,8 @@ impl Store {
                 )?;
             }
             let puts = out.rows.iter().map(|(id, (t, row))| (*t, *id, Some(row.clone())));
-            s.put_rows(puts.chain(out.removed.iter().map(|(id, t)| (*t, *id, None))).collect())?;
-            let root = s.refresh_state_hash()?;
+            let written = s.put_rows(puts.chain(out.removed.iter().map(|(id, t)| (*t, *id, None))).collect())?;
+            let root = s.refresh_state_hash_with(&written)?;
             s.conn.prepare_cached("UPDATE _synod_node SET merged_epoch = ?1, base_root = ?2")?.execute(params![epoch as i64, root.to_vec()],
             )?;
             s.conn.prepare_cached("INSERT INTO _synod_merged (epoch, manifest, manifest_hash, rank, base_before, root, conflicts, undoable)
@@ -819,7 +821,11 @@ impl Store {
     //
     // A row whose indexed columns do not change is updated in place, and
     // its index entries are not written.
-    fn put_rows(&mut self, rows: Vec<(u32, RowId, Option<Row>)>) -> Result<()> {
+    //
+    // Returns the row hash of each row written (`None`: removed), for a
+    // state hash refresh that follows at once.
+    fn put_rows(&mut self, rows: Vec<(u32, RowId, Option<Row>)>) -> Result<WrittenHashes> {
+        let mut written = WrittenHashes::new();
         let mut in_place = Vec::with_capacity(rows.len());
         for (t, id, row) in &rows {
             let schema = &self.tables[*t as usize];
@@ -848,8 +854,9 @@ impl Store {
                 }
             }
             mark_dirty(&self.conn, *t, *id)?;
+            written.insert(id.to_be_bytes().to_vec(), row.as_ref().map(|r| r.hash().0.to_vec()));
         }
-        Ok(())
+        Ok(written)
     }
 
     // Writes back the base-state version of every row changed since the
@@ -866,9 +873,9 @@ impl Store {
                 Ok((tbl, parse_row_id(&id)?, row.map_err(|e| Error::Corrupt(format!("undo row: {e}")))?))
             })
             .collect::<Result<_>>()?;
-        self.put_rows(puts)?;
+        let written = self.put_rows(puts)?;
         self.conn.prepare_cached("DELETE FROM _synod_undo")?.execute([])?;
-        if self.refresh_state_hash()? != base_root {
+        if self.refresh_state_hash_with(&written)? != base_root {
             return Err(Error::Corrupt("the restored base state does not have the base root hash".into()));
         }
         Ok(())

@@ -39,6 +39,9 @@ use crate::values;
 /// WAL pages after which a commit checkpoints by itself.
 const WAL_AUTOCHECKPOINT_PAGES: u32 = 65_536;
 
+/// Row hashes of rows just written, by row ID as stored (`None`: removed).
+pub(crate) type WrittenHashes = std::collections::HashMap<Vec<u8>, Option<Vec<u8>>>;
+
 /// Version of the store file layout.
 pub const STORE_FORMAT: i64 = 6;
 
@@ -628,6 +631,12 @@ impl Store {
     // is the base state (in a merge), or in `current_root`. Runs inside a
     // transaction.
     pub(crate) fn refresh_state_hash(&mut self) -> Result<NodeHash> {
+        self.refresh_state_hash_with(&WrittenHashes::new())
+    }
+
+    // The same, with the row hashes of rows just written (by row ID, as
+    // stored): a row in `written` is not read again.
+    pub(crate) fn refresh_state_hash_with(&mut self, written: &WrittenHashes) -> Result<NodeHash> {
         let hashed: i64 =
             self.conn.prepare_cached("SELECT hashed_seq FROM _synod_node")?.query_row([], |r| r.get(0))?;
         let touched: Vec<(u32, Vec<u8>, i64)> = {
@@ -648,7 +657,10 @@ impl Store {
         for (tbl, id, seq) in touched {
             max_seq = max_seq.max(seq);
             let schema = self.tables.get(tbl as usize).ok_or_else(|| Error::Corrupt(format!("table ID {tbl}")))?;
-            let new = read_row(&self.conn, schema, parse_row_id(&id)?)?.map(|row| row.hash().0.to_vec());
+            let new = match written.get(&id) {
+                Some(h) => h.clone(),
+                None => read_row(&self.conn, schema, parse_row_id(&id)?)?.map(|row| row.hash().0.to_vec()),
+            };
             let old: Option<Vec<u8>> = self
                 .conn
                 .prepare_cached("SELECT hash FROM _synod_rowhash WHERE row_id = ?1")?
