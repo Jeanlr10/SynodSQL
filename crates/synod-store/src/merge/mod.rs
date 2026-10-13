@@ -147,6 +147,7 @@ pub fn merge(base: &dyn BaseState, input: &MergeInput<'_>) -> Result<MergeOutput
         overlay: BTreeMap::new(),
         conflicts: BTreeMap::new(),
         replaced: BTreeMap::new(),
+        keys: Default::default(),
     };
     for (row_id, (table, writers)) in &changes {
         let schema = &tables[*table as usize];

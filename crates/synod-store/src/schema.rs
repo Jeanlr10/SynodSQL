@@ -247,6 +247,15 @@ impl TableSchema {
                 self.name, self.columns[fk.column].name
             ));
         }
+        // Garbage collection finds tombstones, and resolved conflicts, by
+        // these indexes, without a scan of the table.
+        out.push(format!("CREATE INDEX \"_synod_g_{}\" ON \"{physical}\" (\"_tomb\") WHERE \"_tomb\" > 0", self.name));
+        if self.id == 0 {
+            out.push(format!(
+                "CREATE INDEX \"_synod_r_{}\" ON \"{physical}\" (\"epoch\") WHERE \"_tomb\" = 0 AND \"status\" = 'resolved'",
+                self.name
+            ));
+        }
         let mut shown: Vec<String> = Vec::new();
         if let Some(r) = &self.row_id_column {
             shown.push(format!("\"_row_id\" AS \"{r}\""));

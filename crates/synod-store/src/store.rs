@@ -9,7 +9,7 @@
 //! | `_synod_t_<name>` | rows of a managed table, with shadow columns |
 //! | `<name>` (view) | the live rows of a managed table, for normal SQL reads |
 //! | `_synod_log` | one entry per write, in commit order |
-//! | `_synod_sealed` | sealed logs and their hashes |
+//! | `_synod_sealed` | this node's sealed epochs: log hash, entries, root (the log is in `_synod_logs`) |
 //! | `_synod_rowhash` | row hash of every row, for the state hash |
 //! | `_synod_dirty` | rows written outside the log since the last state hash |
 //! | `_synod_undo` | the base-state version of each row changed since the last merge |
@@ -39,7 +39,7 @@ use crate::schema::{TableSchema, parse_create_table, parse_system_table};
 use crate::values;
 
 /// Version of the store file layout.
-pub const STORE_FORMAT: i64 = 4;
+pub const STORE_FORMAT: i64 = 5;
 
 const SETUP: &str = "
 CREATE TABLE _synod_node (
@@ -75,7 +75,6 @@ CREATE INDEX _synod_log_epoch ON _synod_log (epoch, seq);
 CREATE TABLE _synod_sealed (
     epoch INTEGER PRIMARY KEY,
     log_hash BLOB NOT NULL,
-    log BLOB NOT NULL,
     entries INTEGER NOT NULL,
     root BLOB NOT NULL
 ) STRICT;
@@ -513,9 +512,14 @@ impl Store {
     /// Returns a sealed log.
     pub fn sealed(&self, epoch: u64) -> Result<Option<SealedLog>> {
         self.conn
-            .query_row("SELECT log_hash, log, entries, root FROM _synod_sealed WHERE epoch = ?1", [epoch as i64], |r| {
-                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, i64>(2)?, r.get::<_, Vec<u8>>(3)?))
-            })
+            .query_row(
+                "SELECT s.log_hash, l.log, s.entries, s.root FROM _synod_sealed s JOIN _synod_logs l USING (log_hash)
+                 WHERE s.epoch = ?1",
+                [epoch as i64],
+                |r| {
+                    Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, i64>(2)?, r.get::<_, Vec<u8>>(3)?))
+                },
+            )
             .optional()?
             .map(|(hash, bytes, entries, root)| {
                 Ok(SealedLog {
@@ -564,10 +568,8 @@ impl Store {
             let bytes = encode_log(&header, bodies.iter().map(Vec::as_slice));
             let hash = log_hash(&bytes);
             s.conn
-                .prepare_cached(
-                    "INSERT INTO _synod_sealed (epoch, log_hash, log, entries, root) VALUES (?1, ?2, ?3, ?4, ?5)",
-                )?
-                .execute(params![epoch as i64, hash.to_vec(), bytes, bodies.len() as i64, root.to_vec()])?;
+                .prepare_cached("INSERT INTO _synod_sealed (epoch, log_hash, entries, root) VALUES (?1, ?2, ?3, ?4)")?
+                .execute(params![epoch as i64, hash.to_vec(), bodies.len() as i64, root.to_vec()])?;
             s.conn
                 .prepare_cached(
                     "INSERT OR IGNORE INTO _synod_logs (log_hash, node, epoch, log) VALUES (?1, ?2, ?3, ?4)",

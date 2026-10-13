@@ -1,5 +1,6 @@
 //! The constraint pass (specification Section 7.4) and the merge context.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -26,6 +27,35 @@ pub(crate) struct Ctx<'a> {
     /// Versions of rows that the constraint pass replaced. A parent key
     /// value that any of them held can have children that need a check.
     pub replaced: BTreeMap<RowId, Vec<Row>>,
+    /// Live rows of the overlay by (table, key columns) and key value, so
+    /// that a key lookup does not scan the overlay. Built at the first
+    /// lookup of a key; [`Ctx::replace`] keeps it up to date.
+    pub keys: RefCell<KeyIndex>,
+}
+
+/// See [`Ctx::keys`].
+pub(crate) type KeyIndex = BTreeMap<(u32, Vec<usize>), BTreeMap<Vec<u8>, BTreeSet<RowId>>>;
+
+/// The key value as bytes, equal for values that are equal as keys
+/// ([`key_eq`]): REAL −0.0 is 0.0. None if a value is NULL: such a key
+/// matches no row.
+fn key_bytes<'v>(values: impl IntoIterator<Item = &'v Value>) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for v in values {
+        match v {
+            Value::Null => return None,
+            Value::Real(x) if *x == 0.0 => Value::Real(0.0).encode_into(&mut out),
+            v => v.encode_into(&mut out),
+        }
+    }
+    Some(out)
+}
+
+fn row_key(row: &Row, columns: &[usize]) -> Option<Vec<u8>> {
+    if row.is_tombstone() {
+        return None;
+    }
+    key_bytes(columns.iter().map(|&c| &row.cells[c].value))
 }
 
 fn values(row: &Row) -> Vec<Value> {
@@ -96,13 +126,23 @@ impl Ctx<'_> {
             .into_iter()
             .filter(|id| !self.overlay.contains_key(id))
             .collect();
-        for (id, (table, row)) in &self.overlay {
-            if *table == schema.id
-                && !row.is_tombstone()
-                && columns.iter().zip(key).all(|(&c, v)| key_eq(&row.cells[c].value, v))
-            {
-                ids.insert(*id);
+        let Some(wanted) = key_bytes(key) else { return Ok(ids.into_iter().collect()) };
+        let mut keys = self.keys.borrow_mut();
+        let index = keys.entry((schema.id, columns.to_vec())).or_insert_with(|| {
+            let mut index: BTreeMap<Vec<u8>, BTreeSet<RowId>> = BTreeMap::new();
+            for (id, (_, row)) in self.overlay.iter().filter(|(_, (t, _))| *t == schema.id) {
+                if let Some(k) = row_key(row, columns) {
+                    index.entry(k).or_default().insert(*id);
+                }
             }
+            index
+        });
+        if let Some(found) = index.get(&wanted) {
+            debug_assert!(found.iter().all(|id| {
+                let row = &self.overlay[id].1;
+                columns.iter().zip(key).all(|(&c, v)| key_eq(&row.cells[c].value, v))
+            }));
+            ids.extend(found.iter().copied());
         }
         Ok(ids.into_iter().collect())
     }
@@ -112,6 +152,21 @@ impl Ctx<'_> {
         let schema = self.tables[table as usize].clone();
         if let Some(old) = self.get(&schema, row.row_id)? {
             self.replaced.entry(row.row_id).or_default().push(old);
+        }
+        let previous = self.overlay.get(&row.row_id).map(|(_, r)| r);
+        for ((t, columns), index) in self.keys.get_mut().iter_mut().filter(|((t, _), _)| *t == table) {
+            debug_assert_eq!(*t, table);
+            if let Some(k) = previous.and_then(|r| row_key(r, columns))
+                && let Some(set) = index.get_mut(&k)
+            {
+                set.remove(&row.row_id);
+                if set.is_empty() {
+                    index.remove(&k);
+                }
+            }
+            if let Some(k) = row_key(&row, columns) {
+                index.entry(k).or_default().insert(row.row_id);
+            }
         }
         self.overlay.insert(row.row_id, (table, row));
         Ok(())

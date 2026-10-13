@@ -131,9 +131,12 @@ impl BaseState for BaseView<'_> {
         let mut out = Vec::new();
         for t in tables {
             let mut sql =
-                format!("SELECT \"_row_id\" FROM \"{}\" WHERE (\"_tomb\" > 0 AND \"_tomb\" <= ?1)", t.physical());
+                format!("SELECT \"_row_id\" FROM \"{}\" WHERE \"_tomb\" > 0 AND \"_tomb\" <= ?1", t.physical());
             if t.id == 0 {
-                sql.push_str(" OR (\"_tomb\" = 0 AND \"status\" = 'resolved' AND \"epoch\" <= ?2)");
+                sql.push_str(&format!(
+                    " UNION ALL SELECT \"_row_id\" FROM \"{}\" WHERE \"_tomb\" = 0 AND \"status\" = 'resolved' AND \"epoch\" <= ?2",
+                    t.physical()
+                ));
             }
             let mut stmt = self.conn.prepare_cached(&sql)?;
             let args: &[&dyn rusqlite::ToSql] =
