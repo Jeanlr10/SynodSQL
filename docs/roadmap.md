@@ -15,7 +15,7 @@ SynodSQL ships in six phases, and each phase ends with a measurable gate. Phases
 | 4. Custom storage engine | Only if Phase 3 benchmarks show SQLite is the bottleneck | Conditional |
 | 5. Hot indexes and hardening | Read optimizations and long-lived deployments | |
 
-Phase 3 is the main milestone: a complete multi-node database on SQLite. Phase 4 runs only if the Phase 3 benchmarks justify it. Phase 3 still needs gate 3 on real machines and the benchmarks.
+Phase 3 is the main milestone: a complete multi-node database on SQLite. Phase 4 runs only if the Phase 3 benchmarks justify it; they do not, so the plan is to skip it (see the Phase 3 results). Phase 3 still needs gate 3 on real machines.
 
 ## Architecture decisions
 
@@ -129,7 +129,7 @@ More tests: stores that write during the sync converge, and their M(e) equals th
 
 **Found by the gate:** at 100,000 histories, seed 8344 left a live child without a parent and without a conflict. A parent restored from M(e−1) gave up a key value that a new child used, and the next round did not look at that value. The constraint pass now keeps every row version that it replaces. A parent whose key changed now keeps the change, and the orphan child is recorded instead of undoing the parent's other columns.
 
-**Known limits, for the Phase 3 benchmarks:** the constraint pass scans the merged rows for each key lookup (cost Δ² in the number of changed rows). The state hash rebuilt the tree in one pass over all rows; Phase 3 removed this limit (see below).
+**Known limits, for the Phase 3 benchmarks:** the constraint pass scans the merged rows for each key lookup (cost Δ² in the number of changed rows). The state hash rebuilt the tree in one pass over all rows. Phase 3 removed both limits (see below).
 
 ## Phase 3: Sync and multi-node operation
 
@@ -181,6 +181,30 @@ Nodes run epochs automatically over a network. At the end of this phase, SynodSQ
 **Found in the gate runs:** the state hash rebuilt the whole tree several times per epoch, so an epoch got slower as the state grew: 6.8 ms per epoch over the first 1,000 epochs of the 5-node run, and 23 ms over 10,000. The tree is now kept level by level and updated in place (`synod-store/src/tree.rs`, store format 4); a 4,000-epoch run takes 24 s instead of 50 s. Also fixed: garbage collection kept the sealed copy of every given-up log.
 
 **Benchmarks for the Phase 4 decision:** record lookup latency (p50, p99) by row\_id and by secondary index, merge time against log size and database size, and bytes on disk per row. Use uniform, Zipf, and tiered (1% / 9% / 90%) workloads.
+
+**Benchmark results** (`cargo run --release -p synod-store --example phase4_bench`): three nodes, epochs of 60 s, L = 16, on an NVMe disk. Each epoch the nodes together write Δ entries (90% updates, 5% inserts, 5% deletes), seal, and merge one manifest with GC. Merge time is the slowest node, median of 3 epochs (uniform / Zipf / tiered):
+
+| Database rows | Δ = 100 | Δ = 1,000 | Δ = 10,000 |
+| --- | --- | --- | --- |
+| 10k | 17 / 17 / 18 ms | 49 / 53 / 49 ms | 163 / 101 / 90 ms |
+| 100k | 28 / 22 / 32 ms | 122 / 99 / 129 ms | 413 / 313 / 241 ms |
+| 1M | 66 / 87 / 79 ms | 188 / 216 / 267 ms | 1,331 / 933 / 1,088 ms |
+
+At 1M rows and Δ = 10,000, a merge writes 161 to 251 MB, about 25 KB per changed row: each changed row dirties pages in about ten B-trees (rows, unique index, row hashes, tree levels, base tree, undo tables), and the WAL writes each page again at checkpoint. A 256 MB page cache changes merge time by under 10%.
+
+Lookups at 1M rows, p50 / p99 in µs (the three workloads are within 0.2 µs):
+
+| Path | SynodSQL | Plain SQLite |
+| --- | --- | --- |
+| By row\_id, SQL through the view | 2.8 / 4.3 | 2.1 / 2.6 (rowid) |
+| By row\_id, `Store::get` | 3.1 / 3.7 | |
+| By unique index (`sku`) | 4.1 / 4.8 | 3.4 / 4.1 |
+
+Bytes on disk per row at 1M rows: rows 94 (plain SQLite 50), unique index 39 (24), state hash 63, base tree 64, undo and merge records 8. Logs are kept 4L epochs: 300 bytes per row on the node that holds the 1M-row load logs, 21 on a clone. Without logs and free pages, a node holds 255 to 270 bytes per row, against 74 for plain SQLite.
+
+**Decision: skip Phase 4.** None of the three entry conditions shows a limit from SQLite's layout. Lookups are 30 to 40% slower than plain SQLite, at a few µs, because of the view and the wider row. Merge cost is writes to SynodSQL's own metadata trees, which a heap engine would also need. The extra space is row IDs, stamps, and hash caches. The next work is to reduce write amplification and space inside the SQLite build (for example, the base tree duplicates most of the state hash), then Phase 5. Phase 4 stays here in case a later workload shows SQLite as the bottleneck.
+
+**Found by the benchmarks:** the constraint pass was Δ² (a merge of Δ = 10,000 on 10k rows took 1,322 ms; now 163 ms, with a key index over the merge overlay); the rebase after a merge re-read every sealed own log (a Δ = 100 merge on 1M rows took 145 ms; now 66 ms); sealed logs were stored twice (store format 5); and a clone kept the source's free pages (`clone_base` now vacuums the copy).
 
 ## Phase 4: Custom storage engine (conditional)
 
