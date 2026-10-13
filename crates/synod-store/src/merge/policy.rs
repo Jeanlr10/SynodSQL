@@ -46,8 +46,14 @@ pub(crate) fn resolve(column: &Column, cur: &Cell, writes: &[Write]) -> (Cell, O
         MergePolicy::Lww => (lww(cur, writes), None),
         MergePolicy::LwwFlag => {
             let won = lww(cur, writes);
-            let losers: Vec<_> =
+            let mut losers: Vec<_> =
                 writes.iter().filter(|w| w.after != won.value).map(|w| (w.node, w.stamp, w.after.clone())).collect();
+            // A winner that did not see the current value (a late or
+            // in-flight write) overwrites it: the current value lost too.
+            let winner = writes.iter().find(|w| w.stamp == won.stamp);
+            if won.value != cur.value && winner.is_some_and(|w| w.before != cur.value) {
+                losers.push((cur.stamp.node, cur.stamp, cur.value.clone()));
+            }
             let conflict = (!losers.is_empty()).then_some(ColumnConflict { rule: "lww_flag", recorded: losers });
             (won, conflict)
         }
@@ -232,6 +238,15 @@ mod tests {
         let conflict = conflict.unwrap();
         assert_eq!(conflict.rule, "lww_flag");
         assert_eq!(conflict.recorded, vec![(NodeId(0xA), st(10, 0xA), dec("0.12"))]);
+        // A late write that wins over a value it did not see: that value
+        // lost, and is recorded.
+        let (c, conflict) = resolve(&price, &cell(dec("0.12"), 10), &[w(0xC, 17, dec("0.10"), dec("0.11"))]);
+        assert_eq!(c.value, dec("0.11"));
+        assert_eq!(conflict.unwrap().recorded, vec![(NodeId(0), st(10, 0), dec("0.12"))]);
+        // A late write that loses is recorded as before, once.
+        let (c, conflict) = resolve(&price, &cell(dec("0.12"), 20), &[w(0xC, 17, dec("0.10"), dec("0.11"))]);
+        assert_eq!(c.value, dec("0.12"));
+        assert_eq!(conflict.unwrap().recorded, vec![(NodeId(0xC), st(17, 0xC), dec("0.11"))]);
         // r2.qty, delta: 800 + (650 - 800) + (700 - 800) = 550.
         let qty = col(ColumnType::Integer, MergePolicy::Delta);
         let (c, conflict) =
