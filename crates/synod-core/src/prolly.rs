@@ -9,6 +9,8 @@
 //! It gives each finished node to a callback, so a caller can store the
 //! nodes (for the catch-up diff in Phase 3) or ignore them.
 
+use std::sync::LazyLock;
+
 use crate::{RowHash, RowId};
 
 /// Key-derivation context for node hashes.
@@ -26,10 +28,16 @@ pub const ITEM_LEN: usize = 48;
 /// A node hash, which is also the root hash of its subtree.
 pub type NodeHash = [u8; 32];
 
+// Hashers in derive-key mode with their context key already derived: a
+// clone gives the same hashes as a new hasher, without hashing the context
+// again. A tree update hashes every item it reads for its boundary.
+static BOUNDARY_HASHER: LazyLock<blake3::Hasher> = LazyLock::new(|| blake3::Hasher::new_derive_key(BOUNDARY_CONTEXT));
+static NODE_HASHER: LazyLock<blake3::Hasher> = LazyLock::new(|| blake3::Hasher::new_derive_key(NODE_HASH_CONTEXT));
+
 /// Returns true if the item with `key` is the last item of its node at
 /// `level`.
 pub fn is_boundary(level: u8, key: RowId) -> bool {
-    let mut h = blake3::Hasher::new_derive_key(BOUNDARY_CONTEXT);
+    let mut h = BOUNDARY_HASHER.clone();
     h.update(&[level]);
     h.update(&key.to_be_bytes());
     let bytes = h.finalize();
@@ -39,7 +47,7 @@ pub fn is_boundary(level: u8, key: RowId) -> bool {
 
 /// Returns the hash of an encoded node.
 pub fn node_hash(node: &[u8]) -> NodeHash {
-    let mut h = blake3::Hasher::new_derive_key(NODE_HASH_CONTEXT);
+    let mut h = NODE_HASHER.clone();
     h.update(node);
     *h.finalize().as_bytes()
 }
