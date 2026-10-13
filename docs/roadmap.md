@@ -11,11 +11,11 @@ SynodSQL ships in six phases, and each phase ends with a measurable gate. Phases
 | 0. Foundations | Formats, HLC, row IDs, simulator, CI | **Done** |
 | 1. Single-node core on SQLite | Record every write in a form the merge can use | **Done** |
 | 2. Deterministic merge | `M(e) = merge(M(e−1), logs)`; offline file sync | **Done** |
-| 3. Sync and multi-node operation | Automatic epochs over a network | Next |
+| 3. Sync and multi-node operation | Automatic epochs over a network | In progress: gates 1 and 2 met |
 | 4. Custom storage engine | Only if Phase 3 benchmarks show SQLite is the bottleneck | Conditional |
 | 5. Hot indexes and hardening | Read optimizations and long-lived deployments | |
 
-Phase 3 is the main milestone: a complete multi-node database on SQLite. Phase 4 runs only if the Phase 3 benchmarks justify it.
+Phase 3 is the main milestone: a complete multi-node database on SQLite. Phase 4 runs only if the Phase 3 benchmarks justify it. Phase 3 still needs gate 3 on real machines and the benchmarks.
 
 ## Architecture decisions
 
@@ -66,7 +66,7 @@ One node records every write in a form that the merge can use. No merge and no n
 - [x] Write API: assigns row IDs and HLC stamps, and writes one epoch log entry per change, with before-image, after-image, and transaction ID — `Txn` in `synod-store/src/store.rs`
 - [x] Epoch seal: close the log at the HLC boundary and hash it — `Store::seal`, [spec 5.2](spec/v0.1.md)
 - [x] Prolly tree over (row\_id, row hash), updated in one batch at seal time — `synod-core/src/prolly.rs`, [spec 8](spec/v0.1.md)
-- [x] Base-state switch: write the merged state to a new file, then swap it in with an atomic rename — `Store::rewrite` and `Store::install`, [spec 5.3](spec/v0.1.md)
+- [x] Base-state switch: write the merged state to a new file, then swap it in with an atomic rename — `Store::rewrite` and `Store::install`, [spec 5.3](spec/v0.1.md). Since Phase 3, a merge switches inside one SQLite transaction instead (`Store::rebuild`): the new pages go to the WAL beside the old ones, and the commit is the atomic switch. The file copy stays for `rewrite`.
 - [x] Read path: normal SQL reads on the local state, with tombstones hidden by views — `Store::query`
 
 **Exit gate:**
@@ -129,7 +129,7 @@ More tests: stores that write during the sync converge, and their M(e) equals th
 
 **Found by the gate:** at 100,000 histories, seed 8344 left a live child without a parent and without a conflict. A parent restored from M(e−1) gave up a key value that a new child used, and the next round did not look at that value. The constraint pass now keeps every row version that it replaces. A parent whose key changed now keeps the change, and the orphan child is recorded instead of undoing the parent's other columns.
 
-**Known limits, for the Phase 3 benchmarks:** the constraint pass scans the merged rows for each key lookup (cost Δ² in the number of changed rows), and the state hash rebuilds the tree in one pass over all rows.
+**Known limits, for the Phase 3 benchmarks:** the constraint pass scans the merged rows for each key lookup (cost Δ² in the number of changed rows). The state hash rebuilt the tree in one pass over all rows; Phase 3 removed this limit (see below).
 
 ## Phase 3: Sync and multi-node operation
 
@@ -137,22 +137,48 @@ Nodes run epochs automatically over a network. At the end of this phase, SynodSQ
 
 **Deliverables:**
 
-- [ ] Transport: HTTP/2 or QUIC with mutual TLS
-- [ ] Epoch scheduler: seal at the HLC boundary, with a deadline for log arrival
-- [ ] Log exchange: all-to-all first, gossip as an option
-- [ ] Manifest: rotating leader, fallback order, and the priority rule for split leaders
-- [ ] Verify and switch: exchange root hashes; a node with a mismatch repairs itself by a Prolly tree diff and raises an alert
-- [ ] Catch-up: a returning node fetches changed subtrees, and its old logs go into the next manifest as late logs
-- [ ] Lateness bound L: a node more than L epochs behind clones a peer, and its stale entries go to \_conflicts
-- [ ] Garbage collection of tombstones, logs, manifests, and resolved conflicts after L epochs
-- [ ] Revert tool: write a revert log that undoes a chosen node's changes
-- [ ] Metrics: epoch duration, log sizes, conflict counts, hash mismatches
+- [x] Transport: HTTP/2 with mutual TLS; a node takes a message only if the sender's certificate names that node — `crates/synod-net`, `synod serve`, `synod remote`, `synod certs`
+- [x] Epoch scheduler: seal at the HLC boundary, with a deadline for log arrival — `Peer` in `synod-node/src/peer.rs`, a state machine with no I/O that the simulator and the transport both drive
+- [x] Log exchange: all-to-all first, gossip as an option (`PeerConfig::gossip`)
+- [x] Manifest: rotating leader, fallback order, and the priority rule for split leaders
+- [x] Verify and switch: exchange root hashes; a node with a mismatch repairs itself by a Prolly tree diff and raises an alert
+- [x] Catch-up: a returning node fetches changed subtrees, and its old logs go into the next manifest as late logs — `Store::adopt_base`, `TreeWalk`
+- [x] Lateness bound L: a node more than L epochs behind clones a peer, and its stale entries go to \_conflicts — `Store::abandon_log`
+- [x] Garbage collection of tombstones, logs, manifests, and resolved conflicts after L epochs — `gc_through` in the manifest, `Store::gc_local`
+- [x] Revert tool: write a revert log that undoes a chosen node's changes — `Txn::revert`
+- [x] Metrics: epoch duration, log sizes, conflict counts, hash mismatches — `synod-node/src/metrics.rs`
+- [x] Merges by manifest and unmerge, for a manifest of higher priority — `Store::merge_manifest`, `Store::unmerge`
+
+**Addition to the white paper's rule:** by default, a leader publishes a manifest only when it has the logs of a majority of the nodes (`PeerConfig::quorum`). Without it, a minority side of a partition makes its own chain of merges and loses it later, when the majority's chain wins. The rule can be turned off.
 
 **Exit gate:**
 
 1. The simulator runs 5 to 50 nodes for 10,000 epochs with crashes, partitions, clock drift, and late nodes. Nodes on the same manifest have zero root hash mismatches, and no committed write is lost.
 2. Measured conflict counts follow the model in the white paper, Section 9.
 3. A real deployment on at least 3 machines runs the full epoch cycle with no manual work.
+
+**Gate results:**
+
+1. Met. `synod-node/tests/cluster.rs` runs the epoch cycle in the simulator with crashes (also inside disk writes), partitions, message loss, clock offset and drift, and late nodes that stay down longer than L. An oracle checks that every merge of one manifest has one root hash, that all nodes converge, and that no committed write is lost. Twenty independent seeds ran for 10,000 epochs each (`scripts/gate.sh`):
+
+   | Nodes | Seeds | Merges per run | Catch-ups per run | Root hash mismatches |
+   | --- | --- | --- | --- | --- |
+   | 5 | 1 to 12 | 48,881 to 49,740 | 282 (seed 1) | 0 |
+   | 50 | 2 to 9 | 500,109 to 506,257 | 1,990 to 2,370 | 0 |
+
+   One 5-node run has about 1,800 crashes and 450 partitions. More than 500 random clusters of 5 to 12 nodes (`random_clusters`) also pass; their seeds found several real bugs, all fixed.
+2. Met. `conflict_counts_follow_the_model` counts conflicts in 200 epochs of 5 nodes on 1,000 rows. The exact expected value is Σᵢ 1 − (1−qᵢ)ᴺ − N qᵢ (1−qᵢ)ᴺ⁻¹, with qᵢ = 1 − (1−pᵢ)ʷ:
+
+   | Access | w | Measured per epoch | Exact model | White paper, equation 1 |
+   | --- | --- | --- | --- | --- |
+   | Uniform | 20 | 3.77 | 3.77 | 4.00 |
+   | Zipf (s = 1) | 4 | 1.92 | 1.93 | 4.69 |
+   | Tiered (1% / 9% / 90%) | 4 | 5.12 | 5.02 | 12.97 |
+
+   Equation 1 assumes that w pᵢ is small. On skewed access it is not, for the hot rows, and the equation overestimates by 2 to 3 times; the exact formula fits.
+3. Open. `synod-cli/tests/deploy.rs` runs three `synod serve` processes on one machine, over HTTP/2 with mutual TLS, through a restart and a catch-up, with no manual work. The gate asks for at least 3 real machines.
+
+**Found in the gate runs:** the state hash rebuilt the whole tree several times per epoch, so an epoch got slower as the state grew: 6.8 ms per epoch over the first 1,000 epochs of the 5-node run, and 23 ms over 10,000. The tree is now kept level by level and updated in place (`synod-store/src/tree.rs`, store format 4); a 4,000-epoch run takes 24 s instead of 50 s. Also fixed: garbage collection kept the sealed copy of every given-up log.
 
 **Benchmarks for the Phase 4 decision:** record lookup latency (p50, p99) by row\_id and by secondary index, merge time against log size and database size, and bytes on disk per row. Use uniform, Zipf, and tiered (1% / 9% / 90%) workloads.
 
@@ -246,6 +272,6 @@ These choices are still open. Each one has a recommendation and the phase by whi
 | Write capture | Own write API, SQLite triggers, SQLite session extension | **Settled: own write API.** It reads the before-image in the write's transaction, so it needs no extension. The session extension was not evaluated | Phase 1 |
 | Stamp size | Per-column stamps, or one per-row stamp plus per-column versions | **Settled: per-column stamps, stored compactly.** See the Phase 1 measurement | Phase 1 |
 | Default epoch length | A fixed value, or one derived from the conflict model | Configurable; derive the default from the Section 9 model and a target conflict rate | Phase 3 |
-| Manifest agreement | Rotating leader, Raft | Rotating leader first; Raft if split leaders happen in practice | Phase 3 |
-| Transport | HTTP/2 with mutual TLS, QUIC | HTTP/2 first for simple debugging | Phase 3 |
+| Manifest agreement | Rotating leader, Raft | **Settled for Phase 3: rotating leader**, with the majority rule above; Raft only if split leaders cause trouble in practice | Phase 3 |
+| Transport | HTTP/2 with mutual TLS, QUIC | **Settled: HTTP/2 with mutual TLS** | Phase 3 |
 | SQL front end on the custom engine | SQLite virtual tables, own parser, another embedded engine | SQLite virtual tables | Phase 4 |
