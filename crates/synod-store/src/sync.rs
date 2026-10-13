@@ -12,7 +12,7 @@ use std::ops::RangeInclusive;
 use rusqlite::{Connection, OptionalExtension, params};
 use synod_core::log::{decode_log, log_hash};
 use synod_core::manifest::{LogRef, Manifest};
-use synod_core::prolly::{NodeHash, TreeBuilder};
+use synod_core::prolly::NodeHash;
 use synod_core::{LogEntry, NodeId, Row, RowHash, RowId, Stamp, Value};
 
 use crate::error::{Error, Result};
@@ -582,10 +582,7 @@ impl Store {
 
     /// Returns a node of the Prolly tree of the base state (for diffs).
     pub fn base_tree_node(&self, hash: &NodeHash) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .conn
-            .query_row("SELECT node FROM _synod_tree WHERE hash = ?1", [hash.to_vec()], |r| r.get(0))
-            .optional()?)
+        crate::tree::base_node(&self.conn, hash)
     }
 
     /// Returns the row hashes of the base state with row IDs in `(lo, hi]`
@@ -723,28 +720,11 @@ impl Store {
         })
     }
 
-    // Keeps the base state's row hashes and tree nodes, for diffs. Runs when
-    // the physical state is the base state.
+    // Keeps the base state's row hashes and tree, for diffs. Runs when the
+    // physical state is the base state.
     fn index_base(&mut self, root: NodeHash) -> Result<()> {
-        self.conn.execute_batch(
-            "DELETE FROM _synod_base_hash; INSERT INTO _synod_base_hash SELECT row_id, hash FROM _synod_rowhash;
-             DELETE FROM _synod_tree;",
-        )?;
-        let mut nodes = Vec::new();
-        let mut builder = TreeBuilder::with_sink(|h, n: &[u8]| nodes.push((h, n.to_vec())));
-        for (id, h) in self.base_hashes(None, None)? {
-            builder.push(id, h);
-        }
-        let built = builder.finish();
-        if built != root {
+        if crate::tree::index_base(&self.conn)? != root {
             return Err(Error::Corrupt("the base tree does not have the base root hash".into()));
-        }
-        if nodes.is_empty() {
-            nodes.push((root, vec![0; 5]));
-        }
-        let mut stmt = self.conn.prepare_cached("INSERT OR REPLACE INTO _synod_tree (hash, node) VALUES (?1, ?2)")?;
-        for (h, n) in nodes {
-            stmt.execute(params![h.to_vec(), n])?;
         }
         Ok(())
     }
@@ -811,12 +791,14 @@ impl Store {
                     UNION SELECT epoch FROM _synod_logs WHERE node = ?2 AND abandoned = 1)",
                 )?
                 .execute(params![cutoff as i64, me])?;
-            // An own log that no merge took stays until it is given up.
+            // An own log that no merge took stays until it is given up. The
+            // sealed copies go first: the next statement deletes the given-up
+            // logs that select them.
             self.conn.execute_batch(&format!(
-                "DELETE FROM _synod_logs WHERE epoch <= {cutoff} AND (abandoned = 1
-                   OR log_hash IN (SELECT log_hash FROM _synod_merged_log));
-                 DELETE FROM _synod_sealed WHERE epoch <= {cutoff} AND log_hash IN
+                "DELETE FROM _synod_sealed WHERE epoch <= {cutoff} AND log_hash IN
                    (SELECT log_hash FROM _synod_merged_log UNION SELECT log_hash FROM _synod_logs WHERE abandoned = 1);
+                 DELETE FROM _synod_logs WHERE epoch <= {cutoff} AND (abandoned = 1
+                   OR log_hash IN (SELECT log_hash FROM _synod_merged_log));
                  DELETE FROM _synod_merged_log WHERE merged_in <= {cutoff};"
             ))?;
         }

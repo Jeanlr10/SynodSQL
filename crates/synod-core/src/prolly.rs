@@ -49,6 +49,19 @@ pub fn empty_root() -> NodeHash {
     node_hash(&[0, 0, 0, 0, 0])
 }
 
+/// Encodes a node: level, item count, then each item's key and hash. It is
+/// the encoding that [`TreeBuilder`] gives to its callback.
+pub fn encode_node(level: u8, items: &[(RowId, [u8; 32])]) -> Vec<u8> {
+    let mut node = Vec::with_capacity(5 + ITEM_LEN * items.len());
+    node.push(level);
+    node.extend_from_slice(&(items.len() as u32).to_be_bytes());
+    for (key, hash) in items {
+        node.extend_from_slice(&key.to_be_bytes());
+        node.extend_from_slice(hash);
+    }
+    node
+}
+
 struct Level {
     // Encoded node in progress: level, count placeholder, items.
     node: Vec<u8>,
@@ -369,6 +382,22 @@ mod tests {
         let tops: Vec<_> = nodes.iter().filter(|n| n.1 == top).collect();
         assert_eq!(tops.len(), 1);
         assert_eq!(tops[0].0, root);
+    }
+
+    #[test]
+    fn encode_node_matches_the_builder() {
+        let mut nodes = Vec::new();
+        let mut b = TreeBuilder::with_sink(|h, n: &[u8]| nodes.push((h, n.to_vec())));
+        for (k, h) in sorted(0..5_000) {
+            b.push(k, h);
+        }
+        b.finish();
+        for (h, n) in nodes {
+            let (level, items) = decode_node(&n).unwrap();
+            assert_eq!(encode_node(level, &items), n);
+            assert_eq!(node_hash(&encode_node(level, &items)), h);
+        }
+        assert_eq!(encode_node(0, &[]), vec![0; 5]);
     }
 
     #[test]

@@ -42,6 +42,7 @@ pub mod merge;
 pub mod schema;
 mod store;
 mod sync;
+mod tree;
 pub mod values;
 
 pub use env::{Clock, Env, FileSystem, ManualClock, OsFs, SystemClock};

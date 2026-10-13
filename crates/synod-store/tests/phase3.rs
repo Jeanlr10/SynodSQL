@@ -504,3 +504,91 @@ fn revert_undoes_a_nodes_writes() {
     };
     assert_eq!(c.stores[1].query("SELECT name FROM inventory WHERE sku = 'B'", &[]).unwrap().len(), 1);
 }
+
+/// Walks the base tree from its root with this node's nodes only: every
+/// node is there, and the leaves are the base row hashes.
+fn check_base_tree(s: &Store) {
+    let root = s.base_root().unwrap();
+    let mut walk = TreeWalk::new(root);
+    assert!(walk.step(|h| s.base_tree_node(h).unwrap()).unwrap().is_empty(), "a base tree node is missing");
+    assert_eq!(walk.finish(root).unwrap(), s.base_hashes(None, None).unwrap());
+}
+
+/// The tree is updated in place, by levels (specification Section 8). It
+/// grows to several levels, shrinks to almost nothing by deletes and
+/// garbage collection, and grows again, through merges and unmerges. After
+/// each step, the root hash equals a build from all rows, and the base tree
+/// that peers diff against has every node.
+#[test]
+fn the_tree_updated_in_place_equals_a_full_build() {
+    check_seeds("incremental_tree", 2, |seed| {
+        const L: u64 = 2;
+        let mut rng = SimRng::new(seed);
+        let mut c = Cluster::new(3, seed, L);
+        let all = [0, 1, 2];
+        let mut next_sku = 0u64;
+        let mut insert_many = |s: &mut Store, n: u64| {
+            let mut t = s.begin().unwrap();
+            for _ in 0..n {
+                next_sku += 1;
+                t.insert("inventory", &[("sku", text(&format!("S-{next_sku}"))), ("qty", Value::Integer(1))]).unwrap();
+            }
+            t.commit().unwrap();
+        };
+        for epoch in 0..30u64 {
+            c.at(epoch, 100);
+            for i in 0..3 {
+                let live: Vec<RowId> = row_ids(&c.stores[i])
+                    .into_iter()
+                    .filter(|id| c.stores[i].get("inventory", *id).unwrap().is_some())
+                    .collect();
+                let s = &mut c.stores[i];
+                match (epoch, i) {
+                    // Grow to a few thousand rows, then delete almost all,
+                    // then grow again.
+                    (0, 0) | (20, 1) => insert_many(s, 3_000 + rng.below(2_000)),
+                    (10, 2) => {
+                        let mut t = s.begin().unwrap();
+                        for id in live.iter().skip(3) {
+                            t.delete("inventory", *id).unwrap();
+                        }
+                        t.commit().unwrap();
+                    }
+                    _ => {
+                        insert_many(s, rng.below(40));
+                        let mut t = s.begin().unwrap();
+                        for _ in 0..rng.below(40).min(live.len() as u64) {
+                            let id = live[rng.below(live.len() as u64) as usize];
+                            if t.get("inventory", id).unwrap().is_none() {
+                                continue;
+                            }
+                            if rng.chance(300_000) {
+                                t.delete("inventory", id).unwrap();
+                            } else {
+                                t.update("inventory", id, &[("name", text(&format!("n{}", rng.below(1000))))]).unwrap();
+                            }
+                        }
+                        t.commit().unwrap();
+                    }
+                }
+                assert_eq!(c.stores[i].state_hash().unwrap(), c.stores[i].state_hash_from_scratch().unwrap());
+            }
+            let refs = c.seal(epoch, &all, &all);
+            let m = manifest(&c.stores[0], epoch, refs, L);
+            let root = c.merge(&m, &all);
+            // Sometimes one node undoes the merge and merges it again.
+            if rng.chance(200_000) {
+                let i = rng.below(3) as usize;
+                c.stores[i].unmerge().unwrap();
+                check_base_tree(&c.stores[i]);
+                assert_eq!(c.stores[i].merge_manifest(&m).unwrap().root, root);
+            }
+            for s in &mut c.stores {
+                assert_eq!(s.base_root().unwrap(), root);
+                assert_eq!(s.state_hash_from_scratch().unwrap(), root);
+                assert_eq!(s.state_hash().unwrap(), root);
+                check_base_tree(s);
+            }
+        }
+    });
+}

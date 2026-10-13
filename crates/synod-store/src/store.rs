@@ -16,7 +16,9 @@
 //! | `_synod_merged`, `_synod_merged_log` | merged epochs, their manifests and roots |
 //! | `_synod_logs` | every sealed log this node knows (its own and its peers'), for L epochs |
 //! | `_synod_merge_undo` | the M(e−1) version of each row a merge changed, for L epochs (unmerge) |
-//! | `_synod_tree`, `_synod_base_hash` | Prolly tree nodes and row hashes of the base state (diffs) |
+//! | `_synod_level` | upper levels of the state hash tree ([`crate::tree`]) |
+//! | `_synod_base_hash`, `_synod_base_level` | row hashes and tree levels of the base state (diffs) |
+//! | `_synod_tree_changed` | tree items changed since the base state was last indexed |
 //! | `_conflicts` (managed table 0) | conflicts that merges recorded |
 //!
 //! A write changes its row, its log entry, and the counters in one SQLite
@@ -28,7 +30,7 @@ use std::sync::Arc;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 use synod_core::log::{LogHeader, encode_log, log_hash};
-use synod_core::prolly::{NodeHash, TreeBuilder};
+use synod_core::prolly::NodeHash;
 use synod_core::{Cell, Hlc, HlcClock, LogEntry, NodeId, Op, Row, RowHash, RowId, Stamp, TxnId, Value};
 
 use crate::env::Env;
@@ -37,7 +39,7 @@ use crate::schema::{TableSchema, parse_create_table, parse_system_table};
 use crate::values;
 
 /// Version of the store file layout.
-pub const STORE_FORMAT: i64 = 3;
+pub const STORE_FORMAT: i64 = 4;
 
 const SETUP: &str = "
 CREATE TABLE _synod_node (
@@ -116,9 +118,23 @@ CREATE TABLE _synod_merge_undo (
     row BLOB,
     PRIMARY KEY (epoch, row_id)
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE _synod_tree (
-    hash BLOB PRIMARY KEY,
-    node BLOB NOT NULL
+CREATE TABLE _synod_level (
+    level INTEGER NOT NULL,
+    key BLOB NOT NULL,
+    hash BLOB NOT NULL,
+    PRIMARY KEY (level, key)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE _synod_base_level (
+    level INTEGER NOT NULL,
+    key BLOB NOT NULL,
+    hash BLOB NOT NULL,
+    PRIMARY KEY (level, key)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX _synod_base_level_hash ON _synod_base_level (hash);
+CREATE TABLE _synod_tree_changed (
+    level INTEGER NOT NULL,
+    key BLOB NOT NULL,
+    PRIMARY KEY (level, key)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE _synod_base_hash (
     row_id BLOB PRIMARY KEY,
@@ -251,8 +267,6 @@ impl Store {
                 synod_core::prolly::empty_root().to_vec(),
                 config.lateness as i64,
             ])?;
-            conn.prepare_cached("INSERT INTO _synod_tree (hash, node) VALUES (?1, ?2)")?
-                .execute(params![synod_core::prolly::empty_root().to_vec(), vec![0u8; 5]])?;
             conn.execute_batch("COMMIT")?;
         }
         let (format, node, genesis, len, drift, hlc_last, open_epoch, lateness): (i64, u32, i64, i64, i64, i64, i64, i64) =
@@ -590,7 +604,8 @@ impl Store {
     }
 
     // Updates the row hash of every row that a log entry touched since the
-    // last update, then builds the tree. Runs inside a transaction.
+    // last update, then the tree nodes above them. Runs inside a
+    // transaction.
     pub(crate) fn refresh_state_hash(&mut self) -> Result<NodeHash> {
         let hashed: i64 =
             self.conn.prepare_cached("SELECT hashed_seq FROM _synod_node")?.query_row([], |r| r.get(0))?;
@@ -608,6 +623,7 @@ impl Store {
         }
         self.hash_cache = None;
         let mut max_seq = hashed;
+        let mut changed = std::collections::BTreeSet::new();
         for (tbl, id, seq) in touched {
             let schema = self.tables.get(tbl as usize).ok_or_else(|| Error::Corrupt(format!("table ID {tbl}")))?;
             match read_row(&self.conn, schema, parse_row_id(&id)?)? {
@@ -616,22 +632,14 @@ impl Store {
                     .prepare_cached("INSERT OR REPLACE INTO _synod_rowhash (row_id, hash) VALUES (?1, ?2)")?
                     .execute(params![id, row.hash().0.to_vec()])?,
                 // A restore of the base state removed it.
-                None => self.conn.prepare_cached("DELETE FROM _synod_rowhash WHERE row_id = ?1")?.execute([id])?,
+                None => self.conn.prepare_cached("DELETE FROM _synod_rowhash WHERE row_id = ?1")?.execute([&id])?,
             };
+            changed.insert(id);
             max_seq = max_seq.max(seq);
         }
         self.conn.prepare_cached("UPDATE _synod_node SET hashed_seq = ?1")?.execute([max_seq])?;
         self.conn.prepare_cached("DELETE FROM _synod_dirty")?.execute([])?;
-        let mut builder = TreeBuilder::new();
-        let mut stmt = self.conn.prepare_cached("SELECT row_id, hash FROM _synod_rowhash ORDER BY row_id")?;
-        let mut rows = stmt.query([])?;
-        while let Some(r) = rows.next()? {
-            let id = parse_row_id(&r.get::<_, Vec<u8>>(0)?)?;
-            let hash: [u8; 32] =
-                r.get::<_, Vec<u8>>(1)?.try_into().map_err(|_| Error::Corrupt("row hash is not 32 bytes".into()))?;
-            builder.push(id, RowHash(hash));
-        }
-        let root = builder.finish();
+        let root = crate::tree::update(&self.conn, changed)?;
         self.hash_cache = Some(root);
         Ok(root)
     }
