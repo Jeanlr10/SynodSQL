@@ -280,6 +280,12 @@ impl Peer {
             self.next_status_ms = now + self.cfg.status_interval_ms;
             self.anti_entropy()?;
         }
+        // With nothing to send, the WAL goes to the database file now, out
+        // of the next merge's time. After a seal or a merge, the messages
+        // go out first; the next tick checkpoints.
+        if self.out.is_empty() {
+            self.store.checkpoint()?;
+        }
         Ok(())
     }
 

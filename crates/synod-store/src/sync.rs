@@ -816,16 +816,36 @@ impl Store {
     // the state hash. All rows of the batch go first, then the new
     // versions come in: a unique key can move from one row of the batch to
     // another with the unique indexes in place.
+    //
+    // A row whose indexed columns do not change is updated in place, and
+    // its index entries are not written.
     fn put_rows(&mut self, rows: Vec<(u32, RowId, Option<Row>)>) -> Result<()> {
-        for (t, id, _) in &rows {
-            delete_row(&self.conn, &self.tables[*t as usize], *id)?;
-        }
+        let mut in_place = Vec::with_capacity(rows.len());
         for (t, id, row) in &rows {
+            let schema = &self.tables[*t as usize];
+            let keep = match row {
+                Some(new) => read_row(&self.conn, schema, *id)?.is_some_and(|old| {
+                    old.deleted == new.deleted
+                        && indexed_columns(schema).iter().all(|&c| old.cells[c].value == new.cells[c].value)
+                }),
+                None => false,
+            };
+            if !keep {
+                delete_row(&self.conn, schema, *id)?;
+            }
+            in_place.push(keep);
+        }
+        for ((t, id, row), keep) in rows.iter().zip(in_place) {
+            let schema = &self.tables[*t as usize];
             if let Some(row) = row {
-                write_row(&self.conn, &self.tables[*t as usize], row).map_err(|e| match e {
-                    Error::Sql(e) => Error::Corrupt(format!("a merged row breaks a constraint: {e}")),
-                    e => e,
-                })?;
+                if keep {
+                    update_unindexed(&self.conn, schema, row)?;
+                } else {
+                    write_row(&self.conn, schema, row).map_err(|e| match e {
+                        Error::Sql(e) => Error::Corrupt(format!("a merged row breaks a constraint: {e}")),
+                        e => e,
+                    })?;
+                }
             }
             mark_dirty(&self.conn, *t, *id)?;
         }
@@ -934,6 +954,37 @@ impl Store {
         *self = Store::open(&self.path, self.config.clone(), env)?;
         Ok(())
     }
+}
+
+// The columns that an index of the table reads, besides `_tomb` (which
+// every index reads): unique keys, foreign keys, and for `_conflicts` the
+// columns of the index of resolved conflicts. See
+// `TableSchema::create_statements`.
+fn indexed_columns(schema: &TableSchema) -> Vec<usize> {
+    let mut cols: Vec<usize> = schema.uniques.iter().flatten().copied().collect();
+    cols.extend(schema.foreign_keys.iter().map(|f| f.column));
+    if schema.id == 0 {
+        cols.extend(
+            schema.columns.iter().enumerate().filter(|(_, c)| c.name == "epoch" || c.name == "status").map(|(i, _)| i),
+        );
+    }
+    cols
+}
+
+// Writes the stamps and the columns that no index reads, of a row whose
+// other columns and `_tomb` do not change.
+fn update_unindexed(conn: &Connection, schema: &TableSchema, row: &Row) -> Result<()> {
+    let indexed = indexed_columns(schema);
+    let free: Vec<usize> = (0..schema.columns.len()).filter(|c| !indexed.contains(c)).collect();
+    let sets: String =
+        free.iter().enumerate().map(|(k, &c)| format!(", \"{}\" = ?{}", schema.columns[c].name, k + 3)).collect();
+    let sql = format!("UPDATE \"{}\" SET \"_stamps\" = ?2{sets} WHERE \"_row_id\" = ?1", schema.physical());
+    let stamps = crate::store::encode_stamps(&row.cells.iter().map(|c| c.stamp).collect::<Vec<_>>());
+    let mut args: Vec<rusqlite::types::Value> =
+        vec![rusqlite::types::Value::Blob(row.row_id.to_be_bytes().to_vec()), rusqlite::types::Value::Blob(stamps)];
+    args.extend(free.iter().map(|&c| crate::values::to_sql(&row.cells[c].value)));
+    conn.prepare_cached(&sql)?.execute(rusqlite::params_from_iter(args))?;
+    Ok(())
 }
 
 fn delete_row(conn: &Connection, schema: &TableSchema, id: RowId) -> Result<()> {

@@ -331,6 +331,9 @@ impl Cluster {
             let (started, bytes) = (Instant::now(), written());
             let report = node.merge_manifest(&manifest).unwrap();
             merges.push(started.elapsed());
+            // A node checkpoints in idle time, after the merge; its pages
+            // count as written by the merge.
+            node.checkpoint().unwrap();
             wrote = wrote.max(written() - bytes);
             conflicts = report.conflicts.len();
         }

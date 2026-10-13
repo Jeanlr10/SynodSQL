@@ -36,6 +36,9 @@ use crate::error::{Error, Result};
 use crate::schema::{TableSchema, parse_create_table, parse_system_table};
 use crate::values;
 
+/// WAL pages after which a commit checkpoints by itself.
+const WAL_AUTOCHECKPOINT_PAGES: u32 = 65_536;
+
 /// Version of the store file layout.
 pub const STORE_FORMAT: i64 = 6;
 
@@ -228,6 +231,11 @@ impl Store {
             return Err(Error::Invalid(format!("journal mode {mode} instead of WAL")));
         }
         conn.execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = OFF;")?;
+        // A commit checkpoints the WAL only past 256 MB (at 4 KB pages):
+        // the owner checkpoints in idle time ([`Store::checkpoint`]), so
+        // that a merge does not copy its pages to the database file before
+        // it returns.
+        conn.execute_batch(&format!("PRAGMA wal_autocheckpoint = {WAL_AUTOCHECKPOINT_PAGES}"))?;
 
         let exists: bool = conn
             .prepare_cached("SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = '_synod_node'")?
@@ -362,6 +370,15 @@ impl Store {
     pub fn open_epoch(&self) -> Result<u64> {
         Ok(self.conn.prepare_cached("SELECT open_epoch FROM _synod_node")?.query_row([], |r| r.get::<_, i64>(0))?
             as u64)
+    }
+
+    /// Copies the pages of the WAL into the database file, as far as no
+    /// reader holds them (a passive checkpoint). Call it when the node is
+    /// idle, for example after a merge's results are sent; a commit also
+    /// checkpoints by itself once the WAL is large.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        self.conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
+        Ok(())
     }
 
     /// Returns the root hash of the base state M(e−1).
@@ -714,7 +731,7 @@ pub(crate) fn parse_row_id(bytes: &[u8]) -> Result<RowId> {
 /// one full stamp per column (specification Section 4.3). Most rows have
 /// few distinct stamps, because one write stamps all the columns it
 /// changes.
-fn encode_stamps(stamps: &[Stamp]) -> Vec<u8> {
+pub(crate) fn encode_stamps(stamps: &[Stamp]) -> Vec<u8> {
     let mut distinct: Vec<Stamp> = Vec::new();
     let index: Vec<usize> = stamps
         .iter()
