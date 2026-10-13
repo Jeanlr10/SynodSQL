@@ -41,7 +41,12 @@ impl FileSystem for OsFs {
     }
 
     fn sync_file(&self, path: &str) -> io::Result<()> {
-        std::fs::File::open(path)?.sync_all()
+        // Windows flushes a file only through a handle with write access.
+        #[cfg(windows)]
+        let file = std::fs::OpenOptions::new().write(true).open(path)?;
+        #[cfg(not(windows))]
+        let file = std::fs::File::open(path)?;
+        file.sync_all()
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
