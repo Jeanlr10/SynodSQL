@@ -97,12 +97,23 @@ impl Node {
     }
 
     fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
-        let a = self.try_call(method, path, body.as_ref(), "--http1.1").unwrap();
-        let b = self.try_call(method, path, body.as_ref(), "--http2");
-        // Reads give the same answer over both; writes run once.
-        if method == "GET" || path == "/v1/query" {
-            assert_eq!(b.unwrap(), a, "{method} {path}: HTTP/2 differs");
+        // Writes run once, over HTTP/2. Reads run over both, and give the
+        // same answer, but for the status fields that a merge in between
+        // changes.
+        if method != "GET" && path != "/v1/query" {
+            return self.try_call(method, path, body.as_ref(), "--http2").unwrap();
         }
+        let a = self.try_call(method, path, body.as_ref(), "--http1.1").unwrap();
+        let b = self.try_call(method, path, body.as_ref(), "--http2").unwrap();
+        let fixed = |(code, mut v): (u16, Value)| {
+            if path == "/v1/status" {
+                for k in ["open_epoch", "merged_epoch", "next_merge_epoch", "head", "base_root", "unsealed_writes"] {
+                    v.as_object_mut().unwrap().remove(k);
+                }
+            }
+            (code, v)
+        };
+        assert_eq!(fixed(b), fixed(a.clone()), "{method} {path}: HTTP/2 differs");
         a
     }
 }
