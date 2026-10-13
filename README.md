@@ -32,7 +32,26 @@ Read the [white paper](docs/whitepaper.pdf) for the full model, and the [roadmap
 
 ## Status
 
-**Phase 2 (the deterministic merge) is done.** Nodes sync by files: each node seals its epoch, exports its log, and merges the logs of the others. Every node gets the same state, the same conflicts, and the same root hash. There is no network sync yet; Phase 3 (sync and multi-node operation) is next.
+**Phase 3 (sync and multi-node operation) is in progress.** Nodes run as a cluster over HTTP/2 with mutual TLS. Each epoch, every node seals its log and sends it to the others; a rotating leader publishes the manifest (the list of logs to merge); every node merges it and checks that all nodes have the same root hash. A node that was away catches up by comparing Prolly trees, and fetches only the rows that differ. In simulation, runs of 10,000 epochs with 5 and 50 nodes, crashes, partitions, and clock drift end with no root hash mismatch (gates 1 and 2 of the [roadmap](docs/roadmap.md)). Gate 3, a run on three real machines, is still open.
+
+Three nodes on one machine:
+
+```sh
+synod certs certs --nodes 1,2,3                # a cluster CA, and certificates node-1 ... and admin
+synod init n1.db --node 1 --epoch-ms 2000
+synod create-table n1.db "CREATE TABLE stock (row_id ROWID, sku TEXT UNIQUE, qty INTEGER MERGE delta)"
+synod clone n1.db n2.db --node 2 && synod clone n1.db n3.db --node 3
+peers=1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003
+for n in 1 2 3; do synod serve n$n.db --listen 127.0.0.1:700$n --peers $peers --certs certs & done
+
+synod remote 127.0.0.1:7001 --to 1 --certs certs insert stock sku=A-100 qty=800
+synod remote 127.0.0.1:7002 --to 2 --certs certs insert stock sku=B-200 qty=5
+# A few epochs later, every node has both rows and the same base root:
+synod remote 127.0.0.1:7003 --to 3 --certs certs query "SELECT sku, qty FROM stock"
+synod remote 127.0.0.1:7003 --to 3 --certs certs status
+```
+
+Nodes can also sync by files, with no network: each node seals its epoch, exports its log, and merges the logs of the others.
 
 ```sh
 synod init a.db --node 10 --epoch-ms 60000
@@ -71,7 +90,9 @@ let report = store.merge(epoch, &other_logs)?;     // M(e), conflicts, root hash
 | --- | --- |
 | Specification v0.1: formats, schema language, log, merge rules, state hash | [`docs/spec/v0.1.md`](docs/spec/v0.1.md) |
 | HLC, row IDs, canonical encoding, epoch log format, Prolly tree | [`crates/synod-core`](crates/synod-core) |
-| Store on SQLite: schema with `MERGE`, write API, seal, merge, conflicts | [`crates/synod-store`](crates/synod-store) |
+| Store on SQLite: schema with `MERGE`, write API, seal, merge, conflicts, catch-up, revert | [`crates/synod-store`](crates/synod-store) |
+| The node state machine: leaders, manifests, verify, catch-up, repair (no I/O) | [`crates/synod-node`](crates/synod-node) |
+| The network transport: HTTP/2 with mutual TLS | [`crates/synod-net`](crates/synod-net) |
 | The `synod` command | [`crates/synod-cli`](crates/synod-cli) |
 | Deterministic simulator, and a SQLite VFS with crash injection | [`crates/synod-sim`](crates/synod-sim) |
 
@@ -95,6 +116,13 @@ To run more seeds, property cases, or merge histories:
 
 ```sh
 SYNOD_SIM_RUNS=1000 PROPTEST_CASES=10000 SYNOD_MERGE_RUNS=100000 cargo test --workspace --release
+```
+
+The cluster tests of gate 1 run short by default (300 epochs at 5 nodes, 10 at 50). `scripts/gate.sh` runs them long, for many seeds in parallel, one seed per CPU:
+
+```sh
+scripts/gate.sh five 10000 1 12      # 5 nodes, 10,000 epochs, seeds 1 to 12
+scripts/gate.sh fifty 10000 2 9      # 50 nodes
 ```
 
 To build the `synod` command: `cargo install --path crates/synod-cli`.
