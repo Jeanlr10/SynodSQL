@@ -182,15 +182,15 @@ Nodes run epochs automatically over a network. At the end of this phase, SynodSQ
 
 **Benchmarks for the Phase 4 decision:** record lookup latency (p50, p99) by row\_id and by secondary index, merge time against log size and database size, and bytes on disk per row. Use uniform, Zipf, and tiered (1% / 9% / 90%) workloads.
 
-**Benchmark results** (`cargo run --release -p synod-store --example phase4_bench`): three nodes, epochs of 60 s, L = 16, on an NVMe disk. Each epoch the nodes together write Δ entries (90% updates, 5% inserts, 5% deletes), seal, and merge one manifest with GC; 65 empty epochs after the load come first, so that the load's GC is not measured. Merge time is the slowest node, median of 3 epochs (uniform / Zipf / tiered), store format 6:
+**Benchmark results** (`cargo run --release -p synod-store --example phase4_bench`): three nodes, epochs of 60 s, L = 16, on an NVMe disk. Each epoch the nodes together write Δ entries (90% updates, 5% inserts, 5% deletes), seal, and merge one manifest with GC; 65 empty epochs after the load come first, so that the load's GC is not measured. Merge time is the slowest node, median of 3 epochs (uniform / Zipf / tiered), store format 6; the 1M row is after the merge speedups below, the 10k and 100k rows before them:
 
 | Database rows | Δ = 100 | Δ = 1,000 | Δ = 10,000 |
 | --- | --- | --- | --- |
 | 10k | 27 / 23 / 22 ms | 39 / 50 / 49 ms | 148 / 93 / 132 ms |
 | 100k | 18 / 24 / 37 ms | 102 / 86 / 94 ms | 353 / 248 / 191 ms |
-| 1M | 54 / 26 / 27 ms | 212 / 113 / 165 ms | 1,006 / 696 / 844 ms |
+| 1M | 19 / 23 / 29 ms | 74 / 61 / 80 ms | 469 / 324 / 398 ms |
 
-Times under 60 ms vary by 2 times between runs: a merge has a fixed cost of about 10 ms, the fsync of its commit (synchronous = FULL), and a WAL checkpoint falls in some merges and some seals. At 1M rows and Δ = 10,000, a merge writes 120 to 190 MB, about 20 KB per changed row: each changed row dirties a page in each of the rows, the row hashes and the unique index, and the WAL writes each page again at checkpoint. Of the pages a merge changes, the rows are 43%, the row hashes 38%, and the unique index 14%. A 256 MB page cache changes merge time by under 10%.
+Times under 60 ms vary by 2 times between runs: a merge has a fixed cost of about 10 ms, the fsync of its commit (synchronous = FULL). At 1M rows and Δ = 10,000, a merge writes 100 to 160 MB, about 16 KB per changed row: each changed row dirties a page in each of the rows, the row hashes and the unique index, and the WAL writes each page again at checkpoint. Of the pages a merge changes, the rows are 43%, the row hashes 38%, and the unique index 14%. A 256 MB page cache changes merge time by under 10%.
 
 Lookups at 1M rows, p50 / p99 in µs (the three workloads are within 0.2 µs):
 
@@ -202,11 +202,27 @@ Lookups at 1M rows, p50 / p99 in µs (the three workloads are within 0.2 µs):
 
 Bytes on disk per row at 1M rows: rows 94 (plain SQLite 50), unique index 39 (24), state hash 64, undo and merge records 8. Logs are kept 4L epochs: 21 bytes per row once the load's logs are collected. Without logs and free pages, a node holds 200 to 205 bytes per row, against 74 for plain SQLite.
 
-**Decision: skip Phase 4.** None of the three entry conditions shows a limit from SQLite's layout. Lookups are 30 to 40% slower than plain SQLite, at a few µs, because of the view and the wider row. Merge cost is writes to SynodSQL's own metadata trees, which a heap engine would also need. The extra space is row IDs, stamps, and hash caches. The next work is to reduce write amplification and space inside the SQLite build, then Phase 5. Done so far: the base tree copy is gone (store format 6, below). Phase 4 stays here in case a later workload shows SQLite as the bottleneck.
+**Decision: skip Phase 4.** None of the three entry conditions shows a limit from SQLite's layout. Lookups are 30 to 40% slower than plain SQLite, at a few µs, because of the view and the wider row. Merge cost is writes to SynodSQL's own metadata trees, which a heap engine would also need. The extra space is row IDs, stamps, and hash caches. The next work is to reduce write amplification and space inside the SQLite build, then Phase 5. Done so far: the base tree copy is gone (store format 6, below), and merges at 1M rows take half the time (merge speedups, below). Phase 4 stays here in case a later workload shows SQLite as the bottleneck.
 
 **Found by the benchmarks:** the constraint pass was Δ² (a merge of Δ = 10,000 on 10k rows took 1,322 ms; now 163 ms, with a key index over the merge overlay); the rebase after a merge re-read every sealed own log (a Δ = 100 merge on 1M rows took 145 ms; now 66 ms); sealed logs were stored twice (store format 5); and a clone kept the source's free pages (`clone_base` now vacuums the copy).
 
 **Store format 6.** The store kept the state hash tree twice: the local state's, and a copy of the base tree for catch-up, written again item by item at each merge (with an index on node hash). In a merge of 10 changes at 1M rows, half the changed pages were the copy and its index; in a merge of 10,000, a third. The stored tree is now the base tree only; a merge writes it, and local writes stay out of it. The root of the local state, at a seal, is the base tree updated for the rows in `_synod_undo`, in a savepoint that is rolled back. A refresh no longer writes a row hash that did not change, and a tree update finds the boundary before a key from the parent level. Same runs at 1M rows, format 5 against 6: a merge of Δ = 10,000 changes 14,200 pages against 10,000 and takes 981 ms against 802 ms; a seal computes the local root in the savepoint, and the merge does not reuse it: 3 ms at Δ = 100, 100 to 250 ms at Δ = 10,000. Space drops by 64 bytes per row.
+
+**Merge speedups.** At 1M rows and Δ = 10,000 (uniform / Zipf / tiered), each step on top of the last:
+
+| Change | Merge |
+| --- | --- |
+| Store format 6 | 1,006 / 696 / 844 ms |
+| WAL checkpoint in idle time, not in the merge | 628 / 412 / 508 ms |
+| Rows whose deleted flag and indexed columns are unchanged updated in place | 515 / 350 / 436 ms |
+| BLAKE3 derive-key hashers made once | 501 / 324 / 406 ms |
+| Row hashes of the rows just written taken from memory | 469 / 324 / 398 ms |
+
+The WAL checkpoints every 65,536 pages, and a node checkpoints (PASSIVE) at the end of a tick with nothing to send. An update in place writes only the stamps and the unindexed columns, so no index entry changes. A merge now spends about 50 ms restoring the base, 400 ms changing rows, 110 to 150 ms updating the tree, and 60 ms on row hashes. Most of what is left is SQLite writing rows, row hashes and index entries at random places; the next step would be fewer pages per changed row, for example the row hash in the row (38% of the pages a merge changes).
+
+**Large merges.** One merge of Δ = 1,000,000 entries on 1M rows: uniform changes 663k rows, merge 16.9 s, seal 2.8 s, 832 MB written; Zipf 302k rows, 9.7 s and 2.3 s, 602 MB; tiered 173k rows, 7.8 s and 1.2 s, 491 MB. That is 8 to 17 µs per entry, less than at Δ = 10,000, since changed rows share pages.
+
+**10M rows** (store format 6, before the merge speedups). Merge at Δ = 100: 68 to 190 ms; at Δ = 1,000: 320 to 730 ms; at Δ = 10,000: 2.1 / 2.9 / 4.3 s (Zipf / tiered / uniform), 40 to 50 KB written per changed row. A 512 MB page cache changes merge time by under 15%. With the process capped at 3 GB of memory (a database of 4 GB, larger than memory), merges at Δ = 10,000 take 1.4 to 1.7 times as long (3.5 to 5.9 s). Lookups by `Store::get` stay at 2 to 4 µs at the p50; with less of the database cached, SQL lookups go to disk for SynodSQL and plain SQLite alike (p50 of 80 to 250 µs under the cap, p99 up to 2 ms). Space per row is as at 1M rows. None of this shows a limit from SQLite's layout that a heap engine would remove: the decision to skip Phase 4 stands.
 
 **White paper experiments** (Table X; `cargo test --release -p synod-node --test experiments -- --ignored --nocapture`). These run in the simulator with no faults. The index rebuild experiment belongs to Phase 5.
 
