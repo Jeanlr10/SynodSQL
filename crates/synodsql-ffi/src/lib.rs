@@ -589,12 +589,18 @@ pub unsafe extern "C" fn synod_serve(
 }
 
 /// Makes a cluster CA and certificates in `dir` for `nodes` (`1,2,3`) and
-/// `clients` (`admin,...`; NULL for `admin`).
+/// `clients` (`admin,...`; NULL for `admin`). `hosts` (`1=10.0.0.1,...`,
+/// or NULL) adds host names or IP addresses to node certificates.
 ///
 /// # Safety
 /// Strings are NUL-terminated.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn synod_make_certs(dir: *const c_char, nodes: *const c_char, clients: *const c_char) -> c_int {
+pub unsafe extern "C" fn synod_make_certs(
+    dir: *const c_char,
+    nodes: *const c_char,
+    clients: *const c_char,
+    hosts: *const c_char,
+) -> c_int {
     guard(|| {
         let dir = unsafe { str_arg(dir, "dir") }?;
         let nodes: Vec<u32> = unsafe { str_arg(nodes, "nodes") }?
@@ -605,7 +611,9 @@ pub unsafe extern "C" fn synod_make_certs(dir: *const c_char, nodes: *const c_ch
             .collect::<Result<_, _>>()?;
         let clients = if clients.is_null() { "admin" } else { unsafe { str_arg(clients, "clients") }? };
         let clients: Vec<&str> = clients.split(',').map(str::trim).filter(|c| !c.is_empty()).collect();
-        synodsql::make_certs(dir, &nodes, &clients).map(drop).map_err(|e| e.0)
+        let hosts = if hosts.is_null() { Vec::new() } else { members(unsafe { str_arg(hosts, "hosts") }?)? };
+        let hosts: Vec<(u32, &str)> = hosts.iter().map(|(n, h)| (*n, h.as_str())).collect();
+        synodsql::make_certs(dir, &nodes, &clients, &hosts).map(drop).map_err(|e| e.0)
     })
 }
 

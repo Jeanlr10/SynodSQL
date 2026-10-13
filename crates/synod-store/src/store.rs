@@ -33,7 +33,7 @@ use synod_core::{Cell, Hlc, HlcClock, LogEntry, NodeId, Op, Row, RowHash, RowId,
 
 use crate::env::Env;
 use crate::error::{Error, Result};
-use crate::schema::{TableSchema, parse_create_table, parse_system_table};
+use crate::schema::{ColumnType, PHYSICAL_PREFIX, TableSchema, parse_create_table, parse_system_table};
 use crate::values;
 
 /// WAL pages after which a commit checkpoints by itself.
@@ -178,6 +178,26 @@ pub struct Commit {
     pub epoch: u64,
     /// Number of log entries (changed rows); 0 if nothing changed.
     pub entries: u64,
+}
+
+/// A column of a query result ([`Store::query_typed`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResultColumn {
+    /// Name.
+    pub name: String,
+    /// Where it comes from.
+    pub kind: ResultKind,
+}
+
+/// Where a query result column comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResultKind {
+    /// A table's row ID (a 16-byte blob).
+    RowId,
+    /// A table column, of this type.
+    Column(ColumnType),
+    /// An expression, or a table that is not a managed table.
+    Expression,
 }
 
 /// A SynodSQL node store on SQLite.
@@ -481,6 +501,33 @@ impl Store {
             stmt.column_names().into_iter().map(str::to_owned).collect()
         };
         Ok((names, self.query(sql, params)?))
+    }
+
+    /// As [`query_named`](Store::query_named), and also gives where each
+    /// result column comes from: a table's row ID, a table column (with its
+    /// type), or neither (an expression).
+    pub fn query_typed(&self, sql: &str, params: &[Value]) -> Result<(Vec<ResultColumn>, Vec<Vec<SqlValue>>)> {
+        let columns = {
+            let stmt = self.conn.prepare_cached(sql)?;
+            stmt.columns_with_metadata()
+                .iter()
+                .map(|m| {
+                    let table = m.table_name().and_then(|t| t.strip_prefix(PHYSICAL_PREFIX));
+                    let schema = table.and_then(|t| self.tables.iter().find(|s| s.name == t));
+                    let kind = match (schema, m.origin_name()) {
+                        (Some(_), Some("_row_id")) => ResultKind::RowId,
+                        (Some(s), Some(c)) => s
+                            .columns
+                            .iter()
+                            .find(|col| col.name == c)
+                            .map_or(ResultKind::Expression, |col| ResultKind::Column(col.ty.clone())),
+                        _ => ResultKind::Expression,
+                    };
+                    ResultColumn { name: m.name().to_owned(), kind }
+                })
+                .collect()
+        };
+        Ok((columns, self.query(sql, params)?))
     }
 
     /// Returns the values of a live row.

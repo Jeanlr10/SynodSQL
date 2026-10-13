@@ -12,7 +12,10 @@
 //! The same port serves `GET /synod/v1/status`, `GET /metrics`
 //! (Prometheus), and `POST /synod/v1/exec`, which runs a store command
 //! (such as an insert) on the node, for any client with a CA certificate.
+//! It also serves the client API under `/v1/`: JSON over HTTP/1.1 or
+//! HTTP/2 (specification Section 10).
 
+mod api;
 mod tls;
 
 use std::collections::BTreeMap;
@@ -34,7 +37,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc as tmpsc, oneshot};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-pub use tls::{Certs, Tls, cert_names, client_config, make_certs, node_name, server_config};
+pub use tls::{Certs, Tls, cert_names, client_config, make_certs, make_certs_with_hosts, node_name, server_config};
 
 /// Largest message body.
 pub const MAX_BODY: usize = 512 << 20;
@@ -281,11 +284,9 @@ async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor, shared: Arc<S
             let cert = tls.get_ref().1.peer_certificates().and_then(|c| c.first()).cloned();
             let Some(cert) = cert else { return };
             let service = hyper::service::service_fn(move |req| handle(req, cert.clone(), shared.clone()));
-            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .initial_stream_window_size(4 << 20)
-                .initial_connection_window_size(8 << 20)
-                .serve_connection(TokioIo::new(tls), service)
-                .await;
+            let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+            builder.http2().initial_stream_window_size(4 << 20).initial_connection_window_size(8 << 20);
+            let _ = builder.serve_connection(TokioIo::new(tls), service).await;
         });
     }
 }
@@ -332,6 +333,26 @@ async fn handle(
                 Ok(Err(e)) => reply(StatusCode::BAD_REQUEST, e),
                 Err(_) => reply(StatusCode::SERVICE_UNAVAILABLE, "the node stopped"),
             }
+        }
+        (method, p) if p.starts_with("/v1/") => {
+            let Ok(bytes) = read(body).await else { return Ok(reply(StatusCode::PAYLOAD_TOO_LARGE, "")) };
+            let (method, query) = (method.to_owned(), parts.uri.query().unwrap_or("").to_owned());
+            let (tx, rx) = oneshot::channel();
+            let call: Call = Box::new(move |s| {
+                let _ = tx.send(api::handle(s, &method, &path, &query, &bytes));
+            });
+            let _ = shared.inbound.lock().unwrap().send(Inbound::Call(call));
+            let (code, body) = match rx.await {
+                Ok(r) => (StatusCode::from_u16(r.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), r.body),
+                Err(_) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({ "error": { "code": "unavailable", "message": "the node stopped" } }),
+                ),
+            };
+            let mut r = reply(code, serde_json::to_vec(&body).unwrap_or_default());
+            r.headers_mut()
+                .insert(hyper::header::CONTENT_TYPE, hyper::header::HeaderValue::from_static("application/json"));
+            r
         }
         _ => reply(StatusCode::NOT_FOUND, ""),
     })

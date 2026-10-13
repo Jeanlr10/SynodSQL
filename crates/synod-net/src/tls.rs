@@ -50,6 +50,17 @@ pub fn node_name(id: NodeId) -> String {
 /// Makes a cluster CA, and a certificate for each node (`node-<id>`) and
 /// for each extra client name (for example `admin`).
 pub fn make_certs(nodes: &[NodeId], clients: &[&str]) -> Result<Certs, NetError> {
+    make_certs_with_hosts(nodes, clients, &[])
+}
+
+/// As [`make_certs`], and also names each node in `hosts` by those host
+/// names or IP addresses, so that clients such as `curl` can check the
+/// node by the address they connect to.
+pub fn make_certs_with_hosts(
+    nodes: &[NodeId],
+    clients: &[&str],
+    hosts: &[(NodeId, String)],
+) -> Result<Certs, NetError> {
     let tls = |e: rcgen::Error| NetError::Tls(e.to_string());
     let ca_key = KeyPair::generate().map_err(tls)?;
     let mut ca = CertificateParams::new(Vec::<String>::new()).map_err(tls)?;
@@ -58,14 +69,21 @@ pub fn make_certs(nodes: &[NodeId], clients: &[&str]) -> Result<Certs, NetError>
     ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
     let ca_cert = ca.self_signed(&ca_key).map_err(tls)?;
     let issuer = Issuer::new(ca, &ca_key);
-    let names = nodes.iter().map(|n| node_name(*n)).chain(clients.iter().map(|c| c.to_string()));
+    let names = nodes
+        .iter()
+        .map(|n| (node_name(*n), hosts.iter().filter(|(h, _)| h == n).map(|(_, a)| a.clone()).collect()))
+        .chain(clients.iter().map(|c| (c.to_string(), Vec::new())));
     let mut issued = Vec::new();
-    for name in names {
+    for (name, extra) in names {
         let key = KeyPair::generate().map_err(tls)?;
-        let mut p = CertificateParams::new(vec![name.clone()]).map_err(tls)?;
+        let mut sans = vec![name.clone()];
+        sans.extend(extra);
+        let mut p = CertificateParams::new(sans).map_err(tls)?;
         p.distinguished_name.push(DnType::CommonName, name.clone());
         p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
         p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        // Strict X.509 checks (Python 3.13 and later, for example) need it.
+        p.use_authority_key_identifier_extension = true;
         let cert = p.signed_by(&key, &issuer).map_err(tls)?;
         issued.push((name, cert.pem(), key.serialize_pem()));
     }
@@ -98,7 +116,8 @@ fn roots(ca_pem: &[u8]) -> Result<Arc<RootCertStore>, NetError> {
     Ok(Arc::new(roots))
 }
 
-/// The server side: HTTP/2 only, a client certificate from the CA required.
+/// The server side: HTTP/2 and HTTP/1.1, a client certificate from the CA
+/// required.
 pub fn server_config(tls: &Tls) -> Result<Arc<ServerConfig>, NetError> {
     let t = |e: rustls::Error| NetError::Tls(e.to_string());
     let verifier = WebPkiClientVerifier::builder_with_provider(roots(&tls.ca_pem)?, provider())
@@ -110,7 +129,7 @@ pub fn server_config(tls: &Tls) -> Result<Arc<ServerConfig>, NetError> {
         .with_client_cert_verifier(verifier)
         .with_single_cert(certs(&tls.cert_pem)?, key(&tls.key_pem)?)
         .map_err(t)?;
-    config.alpn_protocols = vec![b"h2".to_vec()];
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }
 

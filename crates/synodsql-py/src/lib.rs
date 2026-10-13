@@ -301,12 +301,23 @@ impl Database {
 }
 
 /// Makes a cluster CA and certificates in `dir` for the node IDs `nodes`
-/// and the client names `clients`; returns the number of certificates.
+/// and the client names `clients`; `hosts`, as (node, host or IP), adds
+/// names to node certificates. Returns the number of certificates.
 #[pyfunction]
-#[pyo3(signature = (dir, nodes, clients = vec!["admin".to_owned()]))]
-fn make_certs(py: Python<'_>, dir: String, nodes: Vec<u32>, clients: Vec<String>) -> PyResult<usize> {
-    py.detach(|| synodsql::make_certs(&dir, &nodes, &clients.iter().map(String::as_str).collect::<Vec<_>>()))
-        .map_err(err)
+#[pyo3(signature = (dir, nodes, clients = vec!["admin".to_owned()], hosts = Vec::new()))]
+fn make_certs(
+    py: Python<'_>,
+    dir: String,
+    nodes: Vec<u32>,
+    clients: Vec<String>,
+    hosts: Vec<(u32, String)>,
+) -> PyResult<usize> {
+    py.detach(|| {
+        let clients: Vec<&str> = clients.iter().map(String::as_str).collect();
+        let hosts: Vec<(u32, &str)> = hosts.iter().map(|(n, h)| (*n, h.as_str())).collect();
+        synodsql::make_certs(&dir, &nodes, &clients, &hosts)
+    })
+    .map_err(err)
 }
 
 /// Runs a store command on a running node at `addr`, as a client of the

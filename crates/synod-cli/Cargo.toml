@@ -19,5 +19,8 @@ synod-net.workspace = true
 synodsql.workspace = true
 rusqlite.workspace = true
 
+[dev-dependencies]
+serde_json = "1"
+
 [lints]
 workspace = true

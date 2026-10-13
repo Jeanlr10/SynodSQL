@@ -540,10 +540,13 @@ pub fn load_tls(dir: &str, name: &str) -> Result<synod_net::Tls> {
 }
 
 /// Makes a cluster CA and certificates in `dir`: one per node
-/// (`node-<id>`) and one per client name (such as `admin`).
-pub fn make_certs(dir: &str, nodes: &[u32], clients: &[&str]) -> Result<usize> {
+/// (`node-<id>`) and one per client name (such as `admin`). `hosts` adds
+/// host names or IP addresses to node certificates, as (node, name), so
+/// that HTTP clients can check a node by the address they connect to.
+pub fn make_certs(dir: &str, nodes: &[u32], clients: &[&str], hosts: &[(u32, &str)]) -> Result<usize> {
     let nodes: Vec<NodeId> = nodes.iter().copied().map(NodeId).collect();
-    let certs = synod_net::make_certs(&nodes, clients)?;
+    let hosts: Vec<(NodeId, String)> = hosts.iter().map(|(n, h)| (NodeId(*n), (*h).to_owned())).collect();
+    let certs = synod_net::make_certs_with_hosts(&nodes, clients, &hosts)?;
     let dir = std::path::Path::new(dir);
     std::fs::create_dir_all(dir).map_err(|e| Error(format!("{}: {e}", dir.display())))?;
     let write = |name: String, data: &str| {

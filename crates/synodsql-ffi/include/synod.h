@@ -85,7 +85,8 @@ int synod_merge(synod_db *db, size_t n, const uint8_t *const *logs, const size_t
 /* Cluster: run the node in the background (peers as "id=host:port,...").
  * Other calls go on working while it serves; synod_close stops it. */
 int synod_serve(synod_db *db, const char *listen, const char *peers, const char *certs);
-int synod_make_certs(const char *dir, const char *nodes, const char *clients);
+/* hosts: "1=10.0.0.1,2=db2.example.com" adds names to node certificates (NULL for none). */
+int synod_make_certs(const char *dir, const char *nodes, const char *clients, const char *hosts);
 int synod_remote(const char *addr, uint32_t node, const char *certs, const char *name, size_t argc,
                  const char *const *argv, char **out);
 

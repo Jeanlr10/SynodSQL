@@ -92,7 +92,7 @@ let report = store.merge(epoch, &other_logs)?;     // M(e), conflicts, root hash
 | HLC, row IDs, canonical encoding, epoch log format, Prolly tree | [`crates/synod-core`](crates/synod-core) |
 | Store on SQLite: schema with `MERGE`, write API, seal, merge, conflicts, catch-up, revert | [`crates/synod-store`](crates/synod-store) |
 | The node state machine: leaders, manifests, verify, catch-up, repair (no I/O) | [`crates/synod-node`](crates/synod-node) |
-| The network transport: HTTP/2 with mutual TLS | [`crates/synod-net`](crates/synod-net) |
+| The network transport: HTTP/2 with mutual TLS; the client API (JSON over HTTPS) | [`crates/synod-net`](crates/synod-net), [`docs/api.md`](docs/api.md) |
 | The `synod` command | [`crates/synod-cli`](crates/synod-cli) |
 | The library API: `synodsql::Database` | [`crates/synodsql`](crates/synodsql) |
 | C and C++ API: `libsynod`, `synod.h`, `synod.hpp` | [`crates/synodsql-ffi`](crates/synodsql-ffi) |
@@ -130,6 +130,13 @@ Rust (`synodsql = { git = "https://github.com/Jeanlr10/SynodSQL" }`):
 ```rust
 let mut db = synodsql::Database::create("node.db", &synodsql::Options::new(1))?;
 let id = db.insert("stock", &[("sku", Param::Text("A-100".into())), ("qty", Param::Integer(800))])?;
+```
+
+Any other language uses a node through its JSON API over HTTPS, with no driver: `POST /v1/query`, `POST /v1/write` (one request, one transaction), `GET /v1/tables`, `GET /v1/status`, `GET /v1/conflicts`. See [`docs/api.md`](docs/api.md):
+
+```sh
+curl --cacert certs/ca.pem --cert certs/admin.pem --key certs/admin.key https://127.0.0.1:7001/v1/query \
+     -d '{"sql": "SELECT sku, qty FROM stock WHERE qty > ?1", "params": [100]}'
 ```
 
 To build them here: `cargo build --release -p synodsql-ffi` (in `target/release`), and `maturin build -m crates/synodsql-py/Cargo.toml`. `scripts/test-bindings.sh` builds both and runs their tests.

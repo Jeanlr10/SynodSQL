@@ -239,8 +239,10 @@ class Database {
     synod_db *db_;
 };
 
-inline void make_certs(const std::string &dir, const std::string &nodes, const std::string &clients = "admin") {
-    detail::check(synod_make_certs(dir.c_str(), nodes.c_str(), clients.c_str()));
+// hosts: "1=10.0.0.1,2=db2.example.com" adds names to node certificates.
+inline void make_certs(const std::string &dir, const std::string &nodes, const std::string &clients = "admin",
+                       const std::string &hosts = "") {
+    detail::check(synod_make_certs(dir.c_str(), nodes.c_str(), clients.c_str(), hosts.c_str()));
 }
 
 // A store command on a running node, as a client of the cluster's CA.

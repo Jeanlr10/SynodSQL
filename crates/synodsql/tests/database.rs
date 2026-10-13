@@ -89,7 +89,7 @@ fn two_nodes_sync_by_files() {
 fn a_node_serves_and_takes_calls() {
     let d = dir("serve");
     let certs = p(&d, "certs");
-    assert_eq!(synodsql::make_certs(&certs, &[1], &["admin"]).unwrap(), 2);
+    assert_eq!(synodsql::make_certs(&certs, &[1], &["admin"], &[]).unwrap(), 2);
     let mut db = Database::create(&p(&d, "a.db"), &Options { epoch_ms: 200, ..Options::new(1) }).unwrap();
     db.create_table(STOCK).unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();

@@ -36,8 +36,9 @@ Sync:
                                        undo a node's writes in the kept logs, as new writes
 
 Cluster (HTTP/2 with mutual TLS):
-  certs <dir> --nodes <id,id,...> [--clients <name,...>]
-                                       make a cluster CA and certificates
+  certs <dir> --nodes <id,id,...> [--clients <name,...>] [--hosts <id=host,...>]
+                                       make a cluster CA and certificates; --hosts
+                                       also names nodes by host or IP, for HTTP clients
   serve <db> --listen <addr> --peers <id=host:port,...> --certs <dir>
         [--tick-ms <ms>] [--no-quorum] [--gossip <k>]
                                        run the node: seal, exchange logs, merge
@@ -166,7 +167,7 @@ fn run(args: &[String]) -> R<()> {
             }
         }
         "certs" => {
-            a.known(&["nodes", "clients"])?;
+            a.known(&["nodes", "clients", "hosts"])?;
             let dir = a.at(0, "<dir>")?;
             let nodes: Vec<u32> = list(a.opt("nodes").ok_or("certs needs --nodes <id,id,...>")?)
                 .iter()
@@ -174,7 +175,13 @@ fn run(args: &[String]) -> R<()> {
                 .collect::<R<_>>()?;
             let clients = list(a.opt("clients").unwrap_or("admin"));
             let clients: Vec<&str> = clients.iter().map(String::as_str).collect();
-            let issued = synodsql::make_certs(dir, &nodes, &clients).map_err(|e| e.0)?;
+            let mut hosts = Vec::new();
+            for h in list(a.opt("hosts").unwrap_or("")) {
+                let (id, name) = h.split_once('=').ok_or_else(|| format!("--hosts: expected id=host, found {h}"))?;
+                hosts.push((id.parse::<u32>().map_err(|_| format!("--hosts: not a node ID: {id}"))?, name.to_owned()));
+            }
+            let hosts: Vec<(u32, &str)> = hosts.iter().map(|(n, h)| (*n, h.as_str())).collect();
+            let issued = synodsql::make_certs(dir, &nodes, &clients, &hosts).map_err(|e| e.0)?;
             println!("wrote the CA and {issued} certificates to {dir}");
         }
         "serve" => {
