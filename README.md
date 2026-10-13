@@ -125,6 +125,8 @@ scripts/gate.sh five 10000 1 12      # 5 nodes, 10,000 epochs, seeds 1 to 12
 scripts/gate.sh fifty 10000 2 9      # 50 nodes
 ```
 
+Before you push, `scripts/ci.sh` runs the CI checks on your machine: formatting, clippy, the minimum Rust version, and the tests. `--full` adds the long simulation job, and `--update` first updates the stable toolchain, because CI uses the latest one.
+
 To build the `synod` command: `cargo install --path crates/synod-cli`.
 
 ## Contributing
