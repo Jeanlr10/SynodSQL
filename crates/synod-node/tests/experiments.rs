@@ -206,4 +206,3 @@ fn value_of_column_policies() {
         }
     }
 }
-
