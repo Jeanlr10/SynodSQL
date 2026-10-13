@@ -74,6 +74,19 @@ impl Cluster {
         Some((field("merged_epoch")?.parse().ok()?, field("head")?, field("root")?))
     }
 
+    // Waits until every node answers `sql` with rows that pass `ok`.
+    fn wait_rows(&self, sql: &str, ok: impl Fn(&str) -> bool, timeout: Duration) {
+        let end = Instant::now() + timeout;
+        loop {
+            let rows: Vec<_> = (0..self.ports.len()).map(|i| self.remote(i, &["query", sql])).collect();
+            if rows.iter().all(|r| r.as_deref().is_ok_and(&ok)) {
+                return;
+            }
+            assert!(Instant::now() < end, "rows not merged: {rows:?}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     // Waits until all nodes are on one merge at or after `epoch`.
     fn wait_agree(&self, epoch: u64, timeout: Duration) -> (u64, String, String) {
         let end = Instant::now() + timeout;
@@ -117,35 +130,53 @@ fn three_processes_run_the_epoch_cycle() {
     c.wait_agree(e0 + 3, Duration::from_secs(30));
     c.remote(0, &["update", "stock", &a, "qty=9"]).unwrap();
     c.remote(2, &["update", "stock", &a, "qty=8"]).unwrap();
-    let (e1, _, _) = c.wait_agree(e0 + 6, Duration::from_secs(30));
-    for i in 0..3 {
-        let rows = c.remote(i, &["query", "SELECT sku, qty FROM stock ORDER BY sku"]).unwrap();
-        assert!(rows.contains("A    7") && rows.contains("B    7"), "node {}: {rows}", i + 1);
-    }
+    // The two sales merge, in whatever epoch they fell: 10 − 1 − 2.
+    let both = |rows: &str| rows.contains("A    7") && rows.contains("B    7");
+    c.wait_rows("SELECT sku, qty FROM stock ORDER BY sku", both, Duration::from_secs(30));
 
-    // Node 3 stops for more than L = 8 epochs; the others go on, with
-    // writes; node 3 starts again and catches up. Its last write could
-    // not be merged in time: it is in `_conflicts` as a stale write.
-    c.remote(2, &["insert", "stock", "sku=C", "qty=1"]).unwrap();
-    std::thread::sleep(Duration::from_millis(100));
-    c.stop(2);
-    let end = Instant::now() + Duration::from_secs(30);
-    while c.position(0).is_none_or(|p| p.0 < e1 + 12) {
-        assert!(Instant::now() < end, "nodes 1 and 2 stopped merging without node 3");
-        std::thread::sleep(Duration::from_millis(100));
+    // Node 3 stops for more than L = 8 epochs, right after a write; the
+    // others go on, with writes; node 3 starts again and catches up. Its
+    // last write could not be merged in time: it is in `_conflicts` as a
+    // stale write. If node 3 sealed and sent the write before it stopped
+    // (an epoch ended in between), the write merges: try again.
+    let mut stale = None;
+    for n in 1..=5 {
+        let (e1, _, _) = c.wait_agree(0, Duration::from_secs(30));
+        let sku = format!("C{n}");
+        c.remote(2, &["insert", "stock", &format!("sku={sku}"), "qty=1"]).unwrap();
+        c.stop(2);
+        let end = Instant::now() + Duration::from_secs(30);
+        while c.position(0).is_none_or(|p| p.0 < e1 + 12) {
+            assert!(Instant::now() < end, "nodes 1 and 2 stopped merging without node 3");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let rows = c.remote(0, &["query", "SELECT sku FROM stock"]).unwrap();
+        if !rows.lines().any(|l| l.trim() == sku) {
+            stale = Some(sku);
+            break;
+        }
+        c.start(2);
     }
+    let stale_sku = stale.expect("node 3 sent its last write before it stopped, 5 times");
     c.remote(0, &["insert", "stock", "sku=D", "qty=2"]).unwrap();
     c.start(2);
-    let (e2, head, root) = c.wait_agree(e1 + 14, Duration::from_secs(60));
+    let has = |rows: &str| ["A", "B", "D"].iter().all(|sku| rows.lines().any(|l| l.trim() == *sku));
+    c.wait_rows("SELECT sku FROM stock ORDER BY sku", has, Duration::from_secs(60));
+    // Node 3 gives up its write when it catches up; the conflict then
+    // merges like any write.
+    let end = Instant::now() + Duration::from_secs(60);
     for i in 0..3 {
-        let rows = c.remote(i, &["query", "SELECT sku FROM stock ORDER BY sku"]).unwrap();
-        for sku in ["A", "B", "D"] {
-            assert!(rows.lines().any(|l| l.trim() == sku), "node {} misses {sku}: {rows}", i + 1);
+        loop {
+            let conflicts = c.remote(i, &["conflicts"]).unwrap();
+            if let Some(stale) = conflicts.lines().find(|l| l.contains("stale_write")) {
+                assert!(stale.contains("too_late") && stale.contains(&format!("{stale_sku}, 1")), "{stale}");
+                break;
+            }
+            assert!(Instant::now() < end, "node {}: no stale write: {conflicts}", i + 1);
+            std::thread::sleep(Duration::from_millis(100));
         }
-        let conflicts = c.remote(i, &["conflicts"]).unwrap();
-        let stale = conflicts.lines().find(|l| l.contains("stale_write")).unwrap_or_else(|| panic!("{conflicts}"));
-        assert!(stale.contains("too_late") && stale.contains("C, 1"), "{stale}");
     }
+    let (e2, head, root) = c.wait_agree(0, Duration::from_secs(30));
     let metrics = c.remote(0, &["metrics"]).unwrap();
     assert!(metrics.contains("synod_merges{node=\"1\"}"));
     assert!(metrics.contains("synod_hash_mismatches{node=\"1\"} 0"));

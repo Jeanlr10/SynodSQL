@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use synod_core::NodeId;
 use synod_net::{Member, ServeConfig, Tls, make_certs, request, request_with};
@@ -35,14 +35,19 @@ fn messages_need_the_senders_certificate() {
     let cfg = ServeConfig { listen: addr, members, tls: tls(&certs, "node-1", &certs.ca_pem), tick_ms: 50 };
     let s = stop.clone();
     let server = std::thread::spawn(move || synod_net::serve(peer, cfg, Box::new(|_, _| Ok("ok".into())), s));
-    std::thread::sleep(Duration::from_millis(300));
-
     let to = Member { id: NodeId(1), addr: addr.to_string() };
+    let admin = tls(&certs, "admin", &certs.ca_pem);
+    // Wait until the server listens: a slow machine takes a while.
+    let end = Instant::now() + Duration::from_secs(20);
+    while request(&to, &admin, "GET", "/synod/v1/status", Vec::new()).is_err() {
+        assert!(Instant::now() < end, "the server does not answer");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
     let msg = Msg::GetStatus.encode();
     let post =
         |t: &Tls, from: &str| request_with(&to, t, "POST", "/synod/v1/msg", &[("x-synod-node", from)], msg.clone());
     let node2 = tls(&certs, "node-2", &certs.ca_pem);
-    let admin = tls(&certs, "admin", &certs.ca_pem);
     assert_eq!(post(&node2, "2").unwrap().0, 204);
     assert_eq!(post(&admin, "2").unwrap().0, 403, "admin cannot speak for node 2");
     assert_eq!(post(&node2, "1").unwrap().0, 400, "not from itself");
