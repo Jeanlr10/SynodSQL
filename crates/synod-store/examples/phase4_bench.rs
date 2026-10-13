@@ -173,6 +173,15 @@ struct MergePoint {
     entries: usize,
     rows: usize,
     conflicts: usize,
+    wrote: u64,
+}
+
+// Bytes this process has sent to the storage layer (Linux), or 0.
+fn written() -> u64 {
+    std::fs::read_to_string("/proc/self/io")
+        .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("write_bytes: ").map(|v| v.trim().parse().unwrap_or(0))))
+        .unwrap_or(0)
 }
 
 fn ms(d: Duration) -> f64 {
@@ -308,6 +317,7 @@ impl Cluster {
         let entries = logs.iter().map(|l| l.entries as usize).sum();
         let mut merges = Vec::new();
         let mut conflicts = 0;
+        let mut wrote = 0;
         for (j, node) in self.nodes.iter_mut().enumerate() {
             let mut refs: Vec<LogRef> = Vec::new();
             for (m, log) in logs.iter().enumerate() {
@@ -318,19 +328,22 @@ impl Cluster {
                 }
             }
             let manifest = Manifest::new(epoch, 0, NodeId(1), node.head().unwrap(), epoch.checked_sub(LATENESS), refs);
-            let started = Instant::now();
+            let (started, bytes) = (Instant::now(), written());
             let report = node.merge_manifest(&manifest).unwrap();
             merges.push(started.elapsed());
+            wrote = wrote.max(written() - bytes);
             conflicts = report.conflicts.len();
         }
         self.inserted.extend(fresh);
         let roots: Vec<_> = self.nodes.iter().map(|s| s.base_root().unwrap()).collect();
         assert!(roots.windows(2).all(|w| w[0] == w[1]), "root hash mismatch");
-        (seal, merges, MergeOutcome { entries, rows: touched.len(), conflicts })
+        (seal, merges, MergeOutcome { entries, rows: touched.len(), conflicts, wrote })
     }
 }
 
 struct MergeOutcome {
+    // Bytes written by the merge of the node that wrote most.
+    wrote: u64,
     entries: usize,
     rows: usize,
     conflicts: usize,
@@ -393,7 +406,7 @@ fn main() {
     let dists = [Dist::Uniform, Dist::Zipf, Dist::Tiered];
     println!("# Phase 4 decision benchmarks\n");
     println!(
-        "Three nodes; each epoch the nodes together write Δ entries (90% updates, 5% inserts, 5% deletes), seal, and merge one manifest with GC (L = {LATENESS}). Times are medians over {} epochs; merge is the slowest of the three nodes.\n",
+        "Three nodes; each epoch the nodes together write Δ entries (90% updates, 5% inserts, 5% deletes), seal, and merge one manifest with GC (L = {LATENESS}). Times are medians over {} epochs; merge is the slowest of the three nodes, and bytes written are those of the node that wrote most (WAL and checkpoints).\n",
         a.epochs
     );
     let mut merge_rows = Vec::new();
@@ -405,7 +418,8 @@ fn main() {
         for dist in dists {
             let picker = Picker::new(dist, n, &mut rng);
             for &delta in &a.deltas {
-                let mut p = MergePoint { merge: Vec::new(), seal: Vec::new(), entries: 0, rows: 0, conflicts: 0 };
+                let mut p =
+                    MergePoint { merge: Vec::new(), seal: Vec::new(), entries: 0, rows: 0, conflicts: 0, wrote: 0 };
                 for _ in 0..a.epochs {
                     let (seal, merges, out) = cluster.epoch(&picker, &mut rng, delta);
                     p.seal.push(seal);
@@ -413,16 +427,18 @@ fn main() {
                     p.entries += out.entries;
                     p.rows += out.rows;
                     p.conflicts += out.conflicts;
+                    p.wrote += out.wrote;
                 }
                 let e = a.epochs;
                 let line = format!(
-                    "| {n} | {} | {delta} | {} | {} | {:.1} | {:.1} | {:.3} |",
+                    "| {n} | {} | {delta} | {} | {} | {:.1} | {:.1} | {:.1} | {:.1} |",
                     dist.name(),
                     p.rows / e,
                     p.conflicts / e,
                     ms(median(p.seal)),
-                    ms(median(p.merge.clone())),
-                    ms(median(p.merge)) * 1e3 / (p.entries / e).max(1) as f64,
+                    ms(median(p.merge)),
+                    p.wrote as f64 / e as f64 / 1e6,
+                    p.wrote as f64 / p.rows.max(1) as f64 / 1e3,
                 );
                 eprintln!("{line}");
                 merge_rows.push(line);
@@ -510,8 +526,10 @@ fn main() {
     }
 
     println!("## Merge time\n");
-    println!("| n | workload | Δ entries | rows changed | conflicts | seal ms | merge ms | merge µs per entry |");
-    println!("| --- | --- | --- | --- | --- | --- | --- | --- |");
+    println!(
+        "| n | workload | Δ entries | rows changed | conflicts | seal ms | merge ms | MB written by a merge | KB written per changed row |"
+    );
+    println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
     merge_rows.iter().for_each(|l| println!("{l}"));
     println!("\n## Lookup latency (µs)\n");
     println!("| n | workload | path | p50 | p99 | mean |");

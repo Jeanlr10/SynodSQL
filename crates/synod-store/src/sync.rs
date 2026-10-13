@@ -739,10 +739,17 @@ impl Store {
     fn rebase_local(&mut self) -> Result<usize> {
         let me = self.config.node;
         let entries: Vec<LogEntry> = {
+            // By epoch, through the epoch index: the kept log also holds
+            // the merged epochs of the last 4 L epochs, which a scan would
+            // read at every merge.
             let mut stmt = self.conn.prepare_cached(
-                "SELECT entry FROM _synod_log WHERE epoch NOT IN
-                   (SELECT log_epoch FROM _synod_merged_log WHERE node = ?1
-                    UNION SELECT epoch FROM _synod_logs WHERE node = ?1 AND abandoned = 1)
+                "SELECT entry FROM (
+                   SELECT seq, entry FROM _synod_log WHERE epoch IN
+                     (SELECT s.epoch FROM _synod_sealed s JOIN _synod_logs l USING (log_hash)
+                      WHERE l.abandoned = 0 AND s.log_hash NOT IN
+                        (SELECT log_hash FROM _synod_merged_log WHERE node = ?1))
+                   UNION ALL
+                   SELECT seq, entry FROM _synod_log WHERE epoch >= (SELECT open_epoch FROM _synod_node))
                  ORDER BY seq",
             )?;
             let rows = stmt.query_map([me.0], |r| r.get::<_, Vec<u8>>(0))?;
@@ -883,6 +890,8 @@ impl Store {
                 )?;
                 Ok(())
             })?;
+            // The copy dropped the source's logs: give their pages back.
+            copy.conn.execute_batch("VACUUM")?;
             copy.conn.close().map_err(|(_, e)| Error::Sql(e))?;
         }
         self.env.fs.sync_file(path)?;
