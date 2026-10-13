@@ -391,8 +391,7 @@ fn group(name: &str) -> &'static str {
     match name {
         "_synod_t_inventory" | "inventory" => "rows",
         "_synod_u_inventory_0" | "sqlite_autoindex_inventory_1" => "unique index (sku)",
-        "_synod_rowhash" | "_synod_level" | "_synod_tree_changed" | "_synod_dirty" => "state hash (row hashes, tree)",
-        "_synod_base_hash" | "_synod_base_level" | "_synod_base_level_hash" => "base tree, for catch-up",
+        "_synod_rowhash" | "_synod_level" | "_synod_level_hash" | "_synod_dirty" => "state hash (row hashes, tree)",
         n if n.starts_with("_synod_log") || n == "_synod_sealed" => "logs (kept 4 L epochs)",
         "_synod_undo" | "_synod_merge_undo" | "_synod_merged" | "_synod_merged_log" => "undo and merge records",
         n if n.contains("conflicts") => "_conflicts",

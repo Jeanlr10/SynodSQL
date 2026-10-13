@@ -594,7 +594,7 @@ impl Store {
         let lo = lo.map_or(Vec::new(), |r| r.to_be_bytes().to_vec());
         let hi = hi.map_or(vec![0xFF; 17], |r| r.to_be_bytes().to_vec());
         let mut stmt = self.conn.prepare_cached(
-            "SELECT row_id, hash FROM _synod_base_hash WHERE row_id > ?1 AND row_id <= ?2 ORDER BY row_id",
+            "SELECT row_id, hash FROM _synod_rowhash WHERE row_id > ?1 AND row_id <= ?2 ORDER BY row_id",
         )?;
         let rows = stmt.query_map(params![lo, hi], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
         rows.map(|r| {
@@ -716,20 +716,11 @@ impl Store {
             if root != s.base_root()? {
                 return Err(Error::Corrupt("the new base state does not have its root hash".into()));
             }
-            s.index_base(root)?;
+            // The stored tree is now the tree of the new base state. The
+            // rebased writes stay out of it, in `_synod_undo`.
             let rebased = s.rebase_local()?;
-            s.refresh_state_hash()?;
             Ok((value, rebased))
         })
-    }
-
-    // Keeps the base state's row hashes and tree, for diffs. Runs when the
-    // physical state is the base state.
-    fn index_base(&mut self, root: NodeHash) -> Result<()> {
-        if crate::tree::index_base(&self.conn)? != root {
-            return Err(Error::Corrupt("the base tree does not have the base root hash".into()));
-        }
-        Ok(())
     }
 
     // Applies this node's unmerged writes again on top of the base state:

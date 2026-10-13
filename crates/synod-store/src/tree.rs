@@ -9,10 +9,13 @@
 //! one node per changed key and level, not every row.
 //!
 //! The levels go up to the first level with exactly one item, whose hash is
-//! the root hash; no level is kept above it. The base state M(e−1) has its
-//! own copy (`_synod_base_hash`, `_synod_base_level`), from which a node is
-//! rebuilt when a peer asks for it by hash. `_synod_tree_changed` lists the
-//! items that changed since the last copy, so the copy is incremental too.
+//! the root hash; no level is kept above it.
+//!
+//! The stored tree is the tree of the base state M(e−1): only a merge (or
+//! another change of the base state) writes it. A peer that catches up
+//! asks for its nodes by hash. The tree of the local state, with the
+//! writes since the merge, is made in a savepoint that is rolled back
+//! ([`Store::current_root`](crate::Store)).
 
 use std::collections::BTreeSet;
 
@@ -23,25 +26,16 @@ use synod_core::prolly::{NodeHash, empty_root, encode_node, is_boundary, node_ha
 use crate::error::{Error, Result};
 use crate::store::parse_row_id;
 
-/// Which tree: the current local state, or the base state.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Side {
-    Current,
-    Base,
-}
-
 /// An item key: a row ID, big-endian, as stored.
 type Key = Vec<u8>;
 
 type Items = Vec<(RowId, [u8; 32])>;
 
 // The table, key column, and filter of one level. The filter ends with AND.
-fn source(side: Side, level: u8) -> (&'static str, &'static str, String) {
-    match (side, level) {
-        (Side::Current, 0) => ("_synod_rowhash", "row_id", String::new()),
-        (Side::Base, 0) => ("_synod_base_hash", "row_id", String::new()),
-        (Side::Current, l) => ("_synod_level", "key", format!("level = {l} AND ")),
-        (Side::Base, l) => ("_synod_base_level", "key", format!("level = {l} AND ")),
+fn source(level: u8) -> (&'static str, &'static str, String) {
+    match level {
+        0 => ("_synod_rowhash", "row_id", String::new()),
+        l => ("_synod_level", "key", format!("level = {l} AND ")),
     }
 }
 
@@ -50,22 +44,22 @@ fn hash32(v: Vec<u8>) -> Result<[u8; 32]> {
 }
 
 // Number of items of a level, up to 2.
-fn count2(conn: &Connection, side: Side, level: u8) -> Result<u32> {
-    let (t, _, f) = source(side, level);
+fn count2(conn: &Connection, level: u8) -> Result<u32> {
+    let (t, _, f) = source(level);
     let sql = format!("SELECT count(*) FROM (SELECT 1 FROM {t} WHERE {f}1 LIMIT 2)");
     Ok(conn.prepare_cached(&sql)?.query_row([], |r| r.get(0))?)
 }
 
 // Returns the root hash of a tree whose levels are complete.
-fn root(conn: &Connection, side: Side) -> Result<NodeHash> {
-    if count2(conn, side, 0)? == 0 {
+fn root(conn: &Connection) -> Result<NodeHash> {
+    if count2(conn, 0)? == 0 {
         return Ok(empty_root());
     }
     for level in 1..=u8::MAX {
-        match count2(conn, side, level)? {
+        match count2(conn, level)? {
             0 => break,
             1 => {
-                let (t, _, f) = source(side, level);
+                let (t, _, f) = source(level);
                 let h: Vec<u8> =
                     conn.prepare_cached(&format!("SELECT hash FROM {t} WHERE {f}1"))?.query_row([], |r| r.get(0))?;
                 return hash32(h);
@@ -76,39 +70,23 @@ fn root(conn: &Connection, side: Side) -> Result<NodeHash> {
     Err(Error::Corrupt("the state hash tree has no root".into()))
 }
 
-fn record(conn: &Connection, level: u8, keys: &BTreeSet<Key>) -> Result<()> {
-    let mut stmt = conn.prepare_cached("INSERT OR IGNORE INTO _synod_tree_changed (level, key) VALUES (?1, ?2)")?;
-    for k in keys {
-        stmt.execute(params![level, k])?;
-    }
-    Ok(())
-}
-
 /// Updates the current tree after the row hashes of `rows` changed (in
 /// `_synod_rowhash`), and returns the root hash. Runs inside a transaction.
 pub(crate) fn update(conn: &Connection, rows: BTreeSet<Key>) -> Result<NodeHash> {
-    record(conn, 0, &rows)?;
     let mut changed = rows;
     for level in 0..u8::MAX {
-        let n = count2(conn, Side::Current, level)?;
+        let n = count2(conn, level)?;
         if (level == 0 && n == 0) || (level > 0 && n == 1) {
-            let removed: BTreeSet<(u8, Key)> = conn
-                .prepare_cached("DELETE FROM _synod_level WHERE level > ?1 RETURNING level, key")?
-                .query_map([level], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            for (l, k) in removed {
-                record(conn, l, &BTreeSet::from([k]))?;
-            }
-            return root(conn, Side::Current);
+            conn.prepare_cached("DELETE FROM _synod_level WHERE level > ?1")?.execute([level])?;
+            return root(conn);
         }
-        let next = if count2(conn, Side::Current, level + 1)? == 0 {
+        let next = if count2(conn, level + 1)? == 0 {
             build_level(conn, level)?
         } else if changed.is_empty() {
             BTreeSet::new()
         } else {
             update_level(conn, level, &changed)?
         };
-        record(conn, level + 1, &next)?;
         changed = next;
     }
     Err(Error::Corrupt("the state hash tree is too high".into()))
@@ -124,7 +102,7 @@ fn put_parent(conn: &Connection, level: u8, items: &Items) -> Result<Key> {
 
 // Makes level + 1 from all items of `level`. Returns the new keys.
 fn build_level(conn: &Connection, level: u8) -> Result<BTreeSet<Key>> {
-    let (t, k, f) = source(Side::Current, level);
+    let (t, k, f) = source(level);
     let all: Vec<(Key, Vec<u8>)> = conn
         .prepare_cached(&format!("SELECT {k}, hash FROM {t} WHERE {f}1 ORDER BY {k}"))?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -147,9 +125,23 @@ fn build_level(conn: &Connection, level: u8) -> Result<BTreeSet<Key>> {
 
 // The last boundary key of `level` before `key`, if any.
 fn boundary_before(conn: &Connection, level: u8, key: &[u8]) -> Result<Option<Key>> {
-    let (t, k, f) = source(Side::Current, level);
+    // Each parent key is a boundary of `level`, except the key of the last
+    // node. The parents before `key` are made again already (up to the last
+    // done key) or belong to nodes with no changed key: the last parent
+    // before `key`, if it is a boundary, is the last boundary before it.
+    let parent: Option<Key> = conn
+        .prepare_cached("SELECT key FROM _synod_level WHERE level = ?1 AND key < ?2 ORDER BY key DESC LIMIT 1")?
+        .query_row(params![level + 1, key], |r| r.get(0))
+        .optional()?;
+    let from = match parent {
+        None => return Ok(None),
+        Some(p) if is_boundary(level, parse_row_id(&p)?) => return Ok(Some(p)),
+        // The end of the last node of the level: look back from it.
+        Some(p) => p,
+    };
+    let (t, k, f) = source(level);
     let mut stmt = conn.prepare_cached(&format!("SELECT {k} FROM {t} WHERE {f}{k} < ?1 ORDER BY {k} DESC"))?;
-    let mut rows = stmt.query([key])?;
+    let mut rows = stmt.query([from])?;
     while let Some(r) = rows.next()? {
         let k: Key = r.get(0)?;
         if is_boundary(level, parse_row_id(&k)?) {
@@ -162,7 +154,7 @@ fn boundary_before(conn: &Connection, level: u8, key: &[u8]) -> Result<Option<Ke
 // The node of `level` that starts after `after` (None: at the start): its
 // items, and true if it is the last node of the level.
 fn node_after(conn: &Connection, level: u8, after: Option<&[u8]>) -> Result<(Items, bool)> {
-    let (t, k, f) = source(Side::Current, level);
+    let (t, k, f) = source(level);
     let mut stmt = conn.prepare_cached(&format!("SELECT {k}, hash FROM {t} WHERE {f}{k} > ?1 ORDER BY {k}"))?;
     let mut rows = stmt.query([after.unwrap_or(&[])])?;
     let mut items = Vec::new();
@@ -225,52 +217,24 @@ fn update_level(conn: &Connection, level: u8, changed: &BTreeSet<Key>) -> Result
     Ok(out)
 }
 
-/// Makes the base tree equal to the current tree, by copying the items
-/// that changed since the last copy, and returns its root hash. Runs when
-/// the current state is the base state.
-pub(crate) fn index_base(conn: &Connection) -> Result<NodeHash> {
-    let changed: Vec<(u8, Key)> = conn
-        .prepare_cached("SELECT level, key FROM _synod_tree_changed")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    for (level, key) in changed {
-        if level == 0 {
-            conn.prepare_cached("DELETE FROM _synod_base_hash WHERE row_id = ?1")?.execute([&key])?;
-            conn.prepare_cached(
-                "INSERT INTO _synod_base_hash SELECT row_id, hash FROM _synod_rowhash WHERE row_id = ?1",
-            )?
-            .execute([&key])?;
-        } else {
-            conn.prepare_cached("DELETE FROM _synod_base_level WHERE level = ?1 AND key = ?2")?
-                .execute(params![level, key])?;
-            conn.prepare_cached(
-                "INSERT INTO _synod_base_level SELECT level, key, hash FROM _synod_level WHERE level = ?1 AND key = ?2",
-            )?
-            .execute(params![level, key])?;
-        }
-    }
-    conn.prepare_cached("DELETE FROM _synod_tree_changed")?.execute([])?;
-    root(conn, Side::Base)
-}
-
 /// Returns a node of the base tree by its hash: its items are those of the
 /// level below, after the previous node's last key, up to its own.
 pub(crate) fn base_node(conn: &Connection, hash: &NodeHash) -> Result<Option<Vec<u8>>> {
     if *hash == empty_root() {
-        return Ok((count2(conn, Side::Base, 0)? == 0).then(|| encode_node(0, &[])));
+        return Ok((count2(conn, 0)? == 0).then(|| encode_node(0, &[])));
     }
     let found: Option<(u8, Key)> = conn
-        .prepare_cached("SELECT level, key FROM _synod_base_level WHERE hash = ?1 LIMIT 1")?
+        .prepare_cached("SELECT level, key FROM _synod_level WHERE hash = ?1 LIMIT 1")?
         .query_row([hash.to_vec()], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
     let Some((parent, key)) = found else { return Ok(None) };
     let prev: Key = conn
-        .prepare_cached("SELECT key FROM _synod_base_level WHERE level = ?1 AND key < ?2 ORDER BY key DESC LIMIT 1")?
+        .prepare_cached("SELECT key FROM _synod_level WHERE level = ?1 AND key < ?2 ORDER BY key DESC LIMIT 1")?
         .query_row(params![parent, key], |r| r.get(0))
         .optional()?
         .unwrap_or_default();
     let level = parent - 1;
-    let (t, k, f) = source(Side::Base, level);
+    let (t, k, f) = source(level);
     let items: Items = conn
         .prepare_cached(&format!("SELECT {k}, hash FROM {t} WHERE {f}{k} > ?1 AND {k} <= ?2 ORDER BY {k}"))?
         .query_map(params![prev, key], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)))?

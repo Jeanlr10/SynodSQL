@@ -10,15 +10,13 @@
 //! | `<name>` (view) | the live rows of a managed table, for normal SQL reads |
 //! | `_synod_log` | one entry per write, in commit order |
 //! | `_synod_sealed` | this node's sealed epochs: log hash, entries, root (the log is in `_synod_logs`) |
-//! | `_synod_rowhash` | row hash of every row, for the state hash |
+//! | `_synod_rowhash` | row hash of every row of the base state, for the state hash |
 //! | `_synod_dirty` | rows written outside the log since the last state hash |
 //! | `_synod_undo` | the base-state version of each row changed since the last merge |
 //! | `_synod_merged`, `_synod_merged_log` | merged epochs, their manifests and roots |
 //! | `_synod_logs` | every sealed log this node knows (its own and its peers'), for L epochs |
 //! | `_synod_merge_undo` | the M(e−1) version of each row a merge changed, for L epochs (unmerge) |
-//! | `_synod_level` | upper levels of the state hash tree ([`crate::tree`]) |
-//! | `_synod_base_hash`, `_synod_base_level` | row hashes and tree levels of the base state (diffs) |
-//! | `_synod_tree_changed` | tree items changed since the base state was last indexed |
+//! | `_synod_level` | upper levels of the state hash tree of the base state ([`crate::tree`]) |
 //! | `_conflicts` (managed table 0) | conflicts that merges recorded |
 //!
 //! A write changes its row, its log entry, and the counters in one SQLite
@@ -39,7 +37,7 @@ use crate::schema::{TableSchema, parse_create_table, parse_system_table};
 use crate::values;
 
 /// Version of the store file layout.
-pub const STORE_FORMAT: i64 = 5;
+pub const STORE_FORMAT: i64 = 6;
 
 const SETUP: &str = "
 CREATE TABLE _synod_node (
@@ -123,22 +121,7 @@ CREATE TABLE _synod_level (
     hash BLOB NOT NULL,
     PRIMARY KEY (level, key)
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE _synod_base_level (
-    level INTEGER NOT NULL,
-    key BLOB NOT NULL,
-    hash BLOB NOT NULL,
-    PRIMARY KEY (level, key)
-) STRICT, WITHOUT ROWID;
-CREATE INDEX _synod_base_level_hash ON _synod_base_level (hash);
-CREATE TABLE _synod_tree_changed (
-    level INTEGER NOT NULL,
-    key BLOB NOT NULL,
-    PRIMARY KEY (level, key)
-) STRICT, WITHOUT ROWID;
-CREATE TABLE _synod_base_hash (
-    row_id BLOB PRIMARY KEY,
-    hash BLOB NOT NULL
-) STRICT, WITHOUT ROWID;
+CREATE INDEX _synod_level_hash ON _synod_level (hash);
 CREATE TABLE _synod_merged_log (
     log_hash BLOB PRIMARY KEY,
     merged_in INTEGER NOT NULL,
@@ -199,8 +182,8 @@ pub struct Store {
     pub(crate) config: StoreConfig,
     pub(crate) clock: HlcClock,
     pub(crate) tables: Vec<Arc<TableSchema>>,
-    // The state hash as of the last refresh, while no row changed since.
-    // Cleared at every rollback.
+    // The root of the stored (base) tree as of the last refresh, while no
+    // row changed since. Cleared at every rollback.
     pub(crate) hash_cache: Option<NodeHash>,
 }
 
@@ -550,7 +533,7 @@ impl Store {
         self.clock = HlcClock::resume(self.clock.last().max(hlc_at(end)?), self.config.max_drift_ms);
         let sealed_at = self.clock.now(now)?;
         self.in_txn(|s| {
-            let root = s.refresh_state_hash()?;
+            let root = s.current_root()?;
             let base_root: Vec<u8> =
                 s.conn.prepare_cached("SELECT base_root FROM _synod_node")?.query_row([], |r| r.get(0))?;
             let header = LogHeader {
@@ -582,10 +565,10 @@ impl Store {
         })
     }
 
-    /// Returns the state hash of the current local state. It brings the
-    /// row hash cache up to date first.
+    /// Returns the state hash of the current local state: the base state
+    /// with this node's writes since the last merge.
     pub fn state_hash(&mut self) -> Result<NodeHash> {
-        self.in_txn(|s| s.refresh_state_hash())
+        self.in_txn(|s| s.current_root())
     }
 
     /// Computes the state hash from all rows, without the row hash cache.
@@ -605,8 +588,27 @@ impl Store {
         Ok(synod_core::prolly::root_hash(items))
     }
 
+    // Returns the state hash of the local state. The stored tree is the
+    // base tree, and the rows in `_synod_undo` are the rows that differ
+    // from the base state: the tree is updated for them in a savepoint,
+    // which is rolled back. Runs inside a transaction.
+    pub(crate) fn current_root(&mut self) -> Result<NodeHash> {
+        let cache = self.hash_cache;
+        self.conn.execute_batch("SAVEPOINT synod_current")?;
+        let root = self
+            .conn
+            .execute_batch("INSERT OR REPLACE INTO _synod_dirty (row_id, tbl) SELECT row_id, tbl FROM _synod_undo")
+            .map_err(Error::from)
+            .and_then(|()| self.refresh_state_hash());
+        self.hash_cache = cache;
+        self.conn.execute_batch("ROLLBACK TO synod_current; RELEASE synod_current")?;
+        root
+    }
+
     // Updates the row hash of every row that a log entry touched since the
-    // last update, then the tree nodes above them. Runs inside a
+    // last update, then the tree nodes above them, and returns the root.
+    // The stored tree is the base tree: this runs when the physical state
+    // is the base state (in a merge), or in `current_root`. Runs inside a
     // transaction.
     pub(crate) fn refresh_state_hash(&mut self) -> Result<NodeHash> {
         let hashed: i64 =
@@ -627,17 +629,28 @@ impl Store {
         let mut max_seq = hashed;
         let mut changed = std::collections::BTreeSet::new();
         for (tbl, id, seq) in touched {
+            max_seq = max_seq.max(seq);
             let schema = self.tables.get(tbl as usize).ok_or_else(|| Error::Corrupt(format!("table ID {tbl}")))?;
-            match read_row(&self.conn, schema, parse_row_id(&id)?)? {
-                Some(row) => self
+            let new = read_row(&self.conn, schema, parse_row_id(&id)?)?.map(|row| row.hash().0.to_vec());
+            let old: Option<Vec<u8>> = self
+                .conn
+                .prepare_cached("SELECT hash FROM _synod_rowhash WHERE row_id = ?1")?
+                .query_row([&id], |r| r.get(0))
+                .optional()?;
+            // A row written back to its hashed version (a restore of the
+            // base state) changes no page.
+            if new == old {
+                continue;
+            }
+            match new {
+                Some(h) => self
                     .conn
                     .prepare_cached("INSERT OR REPLACE INTO _synod_rowhash (row_id, hash) VALUES (?1, ?2)")?
-                    .execute(params![id, row.hash().0.to_vec()])?,
+                    .execute(params![id, h])?,
                 // A restore of the base state removed it.
                 None => self.conn.prepare_cached("DELETE FROM _synod_rowhash WHERE row_id = ?1")?.execute([&id])?,
             };
             changed.insert(id);
-            max_seq = max_seq.max(seq);
         }
         self.conn.prepare_cached("UPDATE _synod_node SET hashed_seq = ?1")?.execute([max_seq])?;
         self.conn.prepare_cached("DELETE FROM _synod_dirty")?.execute([])?;
