@@ -166,6 +166,9 @@ pub struct ServeOptions {
     pub quorum: bool,
     /// Gossip to this many peers instead of sending to all.
     pub gossip: Option<usize>,
+    /// Limits on queries while the node serves: by default 5 seconds and
+    /// 64 MiB of results.
+    pub query_limits: synod_store::QueryLimits,
 }
 
 impl ServeOptions {
@@ -178,12 +181,13 @@ impl ServeOptions {
             tick_ms: None,
             quorum: true,
             gossip: None,
+            query_limits: synod_net::DEFAULT_QUERY_LIMITS,
         }
     }
 }
 
 enum Inner {
-    Local(Store),
+    Local(Box<Store>),
     Serving(synod_net::Running),
     Closed,
 }
@@ -218,7 +222,7 @@ impl Database {
     }
 
     fn local(store: Store) -> Database {
-        Database { path: store.path().to_owned(), node: store.config().node.0, inner: Inner::Local(store) }
+        Database { path: store.path().to_owned(), node: store.config().node.0, inner: Inner::Local(Box::new(store)) }
     }
 
     /// The store's file.
@@ -378,7 +382,7 @@ impl Database {
     /// peers over HTTP/2 with mutual TLS, and merges. Calls go on working.
     pub fn serve(&mut self, options: &ServeOptions) -> Result<()> {
         let store = match std::mem::replace(&mut self.inner, Inner::Closed) {
-            Inner::Local(s) => s,
+            Inner::Local(s) => *s,
             other => {
                 self.inner = other;
                 return Err(Error("the node already serves, or is closed".into()));
@@ -390,7 +394,7 @@ impl Database {
                 Ok(())
             }
             Err(e) => {
-                self.inner = Inner::Local(Store::open_existing(&self.path, Env::os())?);
+                self.inner = Inner::Local(Box::new(Store::open_existing(&self.path, Env::os())?));
                 Err(e)
             }
         }
@@ -420,7 +424,7 @@ fn start(store: Store, o: &ServeOptions) -> Result<synod_net::Running> {
     let tick_ms = o.tick_ms.unwrap_or((store.config().epoch_len_ms / 20).clamp(10, 1_000));
     let peer = synod_node::Peer::new(store, cfg)?;
     let exec: synod_net::ExecFn = Box::new(command::run);
-    let config = synod_net::ServeConfig { listen, members, tls, tick_ms };
+    let config = synod_net::ServeConfig { listen, members, tls, tick_ms, query_limits: o.query_limits };
     Ok(synod_net::start(peer, config, exec, Arc::new(AtomicBool::new(false)))?)
 }
 

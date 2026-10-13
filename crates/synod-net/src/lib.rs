@@ -32,6 +32,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::pki_types::ServerName;
 use synod_core::NodeId;
 use synod_node::{Msg, Peer};
+pub use synod_store::QueryLimits;
 use synod_store::Store;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc as tmpsc, oneshot};
@@ -41,6 +42,9 @@ pub use tls::{Certs, Tls, cert_names, client_config, make_certs, make_certs_with
 
 /// Largest message body.
 pub const MAX_BODY: usize = 512 << 20;
+
+/// Largest body of a client API request (`/v1/`).
+pub const MAX_API_BODY: usize = 16 << 20;
 
 /// Errors of the transport.
 #[derive(Debug)]
@@ -93,7 +97,15 @@ pub struct ServeConfig {
     pub tls: Tls,
     /// Time between two ticks of the node.
     pub tick_ms: u64,
+    /// Limits on the statements of callers (the client API, `exec`, and
+    /// [`Running::call`]), which run on the node's thread: a slow query
+    /// would hold up the node's epochs.
+    pub query_limits: QueryLimits,
 }
+
+/// The default [`ServeConfig::query_limits`]: 5 seconds, 64 MiB.
+pub const DEFAULT_QUERY_LIMITS: QueryLimits =
+    QueryLimits { time: Some(Duration::from_secs(5)), max_bytes: Some(64 << 20) };
 
 /// Runs a store command for `/synod/v1/exec`: the arguments of a `synod`
 /// command, without the store path. Returns its output.
@@ -181,7 +193,8 @@ impl Drop for Running {
 
 /// Starts a node in the background; it runs until `stop` is set, the node
 /// fails, or the handle is dropped.
-pub fn start(peer: Peer, cfg: ServeConfig, exec: ExecFn, stop: Arc<AtomicBool>) -> Result<Running, NetError> {
+pub fn start(mut peer: Peer, cfg: ServeConfig, exec: ExecFn, stop: Arc<AtomicBool>) -> Result<Running, NetError> {
+    peer.store_mut().set_query_limits(cfg.query_limits);
     let me = peer.store().config().node;
     let server_tls = tls::server_config(&cfg.tls)?;
     let client_tls = tls::client_config(&cfg.tls)?;
@@ -304,7 +317,8 @@ async fn handle(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let (parts, body) = req.into_parts();
     let path = parts.uri.path().to_owned();
-    let read = |body: Incoming| async move { Limited::new(body, MAX_BODY).collect().await.map(|b| b.to_bytes()) };
+    let read =
+        |body: Incoming, max: usize| async move { Limited::new(body, max).collect().await.map(|b| b.to_bytes()) };
     Ok(match (parts.method.as_str(), path.as_str()) {
         ("POST", "/synod/v1/msg") => {
             let from = parts.headers.get("x-synod-node").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
@@ -314,14 +328,14 @@ async fn handle(
             if !tls::cert_names(&cert, &tls::node_name(from)) {
                 return Ok(reply(StatusCode::FORBIDDEN, "the certificate does not name the sender"));
             }
-            let Ok(bytes) = read(body).await else { return Ok(reply(StatusCode::PAYLOAD_TOO_LARGE, "")) };
+            let Ok(bytes) = read(body, MAX_BODY).await else { return Ok(reply(StatusCode::PAYLOAD_TOO_LARGE, "")) };
             let _ = shared.inbound.lock().unwrap().send(Inbound::Msg(from, bytes.to_vec()));
             reply(StatusCode::NO_CONTENT, "")
         }
         ("GET", "/synod/v1/status") => reply(StatusCode::OK, shared.snapshot.lock().unwrap().status.clone()),
         ("GET", "/metrics") => reply(StatusCode::OK, shared.snapshot.lock().unwrap().metrics.clone()),
         ("POST", "/synod/v1/exec") => {
-            let Ok(bytes) = read(body).await else { return Ok(reply(StatusCode::PAYLOAD_TOO_LARGE, "")) };
+            let Ok(bytes) = read(body, MAX_BODY).await else { return Ok(reply(StatusCode::PAYLOAD_TOO_LARGE, "")) };
             let Ok(text) = String::from_utf8(bytes.to_vec()) else {
                 return Ok(reply(StatusCode::BAD_REQUEST, "not UTF-8"));
             };
@@ -335,19 +349,25 @@ async fn handle(
             }
         }
         (method, p) if p.starts_with("/v1/") => {
-            let Ok(bytes) = read(body).await else { return Ok(reply(StatusCode::PAYLOAD_TOO_LARGE, "")) };
-            let (method, query) = (method.to_owned(), parts.uri.query().unwrap_or("").to_owned());
-            let (tx, rx) = oneshot::channel();
-            let call: Call = Box::new(move |s| {
-                let _ = tx.send(api::handle(s, &method, &path, &query, &bytes));
-            });
-            let _ = shared.inbound.lock().unwrap().send(Inbound::Call(call));
-            let (code, body) = match rx.await {
-                Ok(r) => (StatusCode::from_u16(r.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), r.body),
+            let error =
+                |code: &str, message: String| serde_json::json!({ "error": { "code": code, "message": message } });
+            let (code, body) = match read(body, MAX_API_BODY).await {
                 Err(_) => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    serde_json::json!({ "error": { "code": "unavailable", "message": "the node stopped" } }),
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    error("too_large", format!("the body is larger than {MAX_API_BODY} bytes")),
                 ),
+                Ok(bytes) => {
+                    let (method, query) = (method.to_owned(), parts.uri.query().unwrap_or("").to_owned());
+                    let (tx, rx) = oneshot::channel();
+                    let call: Call = Box::new(move |s| {
+                        let _ = tx.send(api::handle(s, &method, &path, &query, &bytes));
+                    });
+                    let _ = shared.inbound.lock().unwrap().send(Inbound::Call(call));
+                    match rx.await {
+                        Ok(r) => (StatusCode::from_u16(r.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), r.body),
+                        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, error("unavailable", "the node stopped".into())),
+                    }
+                }
             };
             let mut r = reply(code, serde_json::to_vec(&body).unwrap_or_default());
             r.headers_mut()

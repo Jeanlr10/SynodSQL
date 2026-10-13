@@ -35,6 +35,7 @@ fn store_error(e: Error) -> Reply {
         Error::Invalid(_) => (400, "invalid"),
         Error::Sql(_) => (400, "sql"),
         Error::Clock(_) | Error::TooEarly { .. } => (503, "clock"),
+        Error::Limit(_) => (400, "limit"),
         Error::Io(_) | Error::Corrupt(_) => (500, "internal"),
     };
     fail(status, code, e.to_string())
@@ -265,6 +266,9 @@ fn row_id(j: &Json) -> Result<RowId, String> {
 
 fn write(s: &mut Store, b: &Map<String, Json>) -> Result<Reply, Reply> {
     let ops = field(b, "ops")?.as_array().ok_or_else(|| bad("\"ops\" is not an array"))?;
+    if ops.is_empty() {
+        return Err(bad("\"ops\" is empty"));
+    }
     // Check every op first; then apply them all in one transaction.
     let mut planned = Vec::new();
     for (i, op) in ops.iter().enumerate() {

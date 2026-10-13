@@ -252,7 +252,7 @@ impl Database {
 
     /// Runs the node in the background: `peers` maps node IDs to
     /// `host:port`, `certs` is the cluster's certificate directory.
-    #[pyo3(signature = (listen, peers, certs, *, tick_ms = None, quorum = true, gossip = None))]
+    #[pyo3(signature = (listen, peers, certs, *, tick_ms = None, quorum = true, gossip = None, query_ms = 5000, result_mb = 64))]
     #[allow(clippy::too_many_arguments)]
     fn serve(
         &self,
@@ -263,8 +263,14 @@ impl Database {
         tick_ms: Option<u64>,
         quorum: bool,
         gossip: Option<usize>,
+        query_ms: u64,
+        result_mb: usize,
     ) -> PyResult<()> {
-        let o = ServeOptions { listen, peers, certs, tick_ms, quorum, gossip };
+        let query_limits = synodsql::synod_store::QueryLimits {
+            time: (query_ms > 0).then_some(std::time::Duration::from_millis(query_ms)),
+            max_bytes: (result_mb > 0).then_some(result_mb << 20),
+        };
+        let o = ServeOptions { listen, peers, certs, tick_ms, quorum, gossip, query_limits };
         self.run(py, move |db| db.serve(&o))
     }
 

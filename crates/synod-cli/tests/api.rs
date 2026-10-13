@@ -53,7 +53,7 @@ impl Node {
         let listen = format!("127.0.0.1:{port}");
         let peers = format!("{id}={listen}");
         let child = Command::new(env!("CARGO_BIN_EXE_synod"))
-            .args(["serve", db, "--listen", &listen, "--peers", &peers, "--certs", "certs"])
+            .args(["serve", db, "--listen", &listen, "--peers", &peers, "--certs", "certs", "--query-ms", "300"])
             .current_dir(&dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -76,7 +76,11 @@ impl Node {
         cmd.args(["-sS", http, "--cacert", &c("ca.pem"), "--cert", &c("admin.pem"), "--key", &c("admin.key")]);
         cmd.args(["-X", method, "-w", "\n%{http_code}", &url]);
         if let Some(b) = body {
-            cmd.args(["-H", "content-type: application/json", "--data-binary", &b.to_string()]);
+            // From a file: a command-line argument is at most 128 KiB.
+            let file = self.dir.join("body.json");
+            std::fs::write(&file, b.to_string()).unwrap();
+            cmd.args(["-H", "content-type: application/json", "--data-binary"]);
+            cmd.arg(format!("@{}", file.display()));
         }
         let out = cmd.output().map_err(|e| format!("curl: {e}"))?;
         if !out.status.success() {
@@ -213,6 +217,32 @@ fn any_http_client_uses_the_api() {
     let (code, e) = n.try_call("POST", "/v1/query", Some(&json!("not an object")), "--http1.1").unwrap();
     assert_eq!((code, e["error"]["code"].as_str()), (400, Some("bad_request")));
 
+    let (code, e) = n.call("POST", "/v1/write", Some(json!({ "ops": [] })));
+    assert_eq!((code, e["error"]["code"].as_str()), (400, Some("bad_request")), "{e}");
+    let big = json!({ "sql": "SELECT 1", "pad": "x".repeat(17 << 20) });
+    let (code, e) = n.try_call("POST", "/v1/query", Some(&big), "--http1.1").unwrap();
+    assert_eq!((code, e["error"]["code"].as_str()), (413, Some("too_large")), "{e}");
+
+    // Statements that would change the node's connection are refused, and
+    // the node goes on: an open transaction used to stop it.
+    for sql in ["BEGIN", "SAVEPOINT x", "ATTACH 'other.db' AS o", "PRAGMA synchronous = OFF"] {
+        let (code, e) = n.call("POST", "/v1/query", Some(json!({ "sql": sql })));
+        assert_eq!((code, e["error"]["code"].as_str()), (400, Some("invalid")), "{sql}: {e}");
+    }
+    assert!(!n.dir.join("other.db").exists());
+    // A query that would run forever stops at the limit (--query-ms 300).
+    let forever = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c";
+    let start = Instant::now();
+    let (code, e) = n.call("POST", "/v1/query", Some(json!({ "sql": forever })));
+    assert_eq!((code, e["error"]["code"].as_str()), (400, Some("limit")), "{e}");
+    assert!(start.elapsed() < Duration::from_secs(5));
+    let (code, w2) = n.call(
+        "POST",
+        "/v1/write",
+        Some(json!({ "ops": [{ "insert": { "table": "stock", "values": { "sku": "D" } } }] })),
+    );
+    assert_eq!(code, 200, "{w2}");
+
     let (code, c) = n.call("GET", "/v1/conflicts?all=true", None);
     assert_eq!((code, c["conflicts"].is_array()), (200, true), "{c}");
     let (code, _) = n.call("POST", "/v1/conflicts/00000001-0000000000000063/resolve", None);
@@ -222,7 +252,7 @@ fn any_http_client_uses_the_api() {
     let end = Instant::now() + Duration::from_secs(20);
     loop {
         let (_, s) = n.call("GET", "/v1/status", None);
-        if s["merged_epoch"].as_u64().is_some_and(|m| m >= w["epoch"].as_u64().unwrap()) {
+        if s["merged_epoch"].as_u64().is_some_and(|m| m >= w2["epoch"].as_u64().unwrap()) {
             break;
         }
         assert!(Instant::now() < end, "{s}");

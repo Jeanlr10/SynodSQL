@@ -18,7 +18,7 @@ synod-net = { path = "crates/synod-net", version = "0.0.1" }
 synodsql = { path = "crates/synodsql", version = "0.0.1" }
 blake3 = "1.8"
 proptest = "1.12"
-rusqlite = { version = "0.40", features = ["bundled", "column_metadata"] }
+rusqlite = { version = "0.40", features = ["bundled", "column_metadata", "hooks"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

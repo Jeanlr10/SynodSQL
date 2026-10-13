@@ -4,7 +4,7 @@ Every SynodSQL node serves a JSON API on its port, for programs in any language:
 
 - HTTPS with mutual TLS, HTTP/1.1 or HTTP/2.
 - One request is one call. A write request is one transaction: all of its operations, or none.
-- No sessions, no drivers. Bodies and answers are JSON objects.
+- No sessions, no drivers. Bodies (at most 16 MiB) and answers are JSON objects.
 
 ## Setup
 
@@ -54,7 +54,7 @@ api /v1/write -d '{"ops": [
 #  "epoch":5973055767,"hlc":"1791916730257.0"}
 ```
 
-Updates and deletes take a `row_id`, or a `where` condition with `params`. If one op fails, nothing is written, and the error gives the op's index in `op`.
+Updates and deletes take a `row_id`, or a `where` condition with `params`. `ops` must not be empty. If one op fails, nothing is written, and the error gives the op's index in `op`.
 
 ### Query
 
@@ -64,6 +64,8 @@ api /v1/query -d '{"sql": "SELECT row_id, sku, qty, tags FROM stock WHERE qty > 
 #             {"name":"qty","type":"INTEGER"},{"name":"tags","type":"SET<TEXT>"}],
 #  "rows":[["00000001-0000000000000008","A-100",800,["red"]]]}
 ```
+
+A query may only read: transaction statements, `ATTACH`, and `PRAGMA` are refused. It stops after 5 seconds, or at 64 MiB of results, with error `limit` (`synod serve --query-ms <ms> --result-mb <MiB>`; 0 for no limit). Requests run one at a time on the node's thread, so keep queries short.
 
 A column's `type` is the type of the table column it comes from, or `null` for an expression. Add `"ints_as_strings": true` to get integers as strings (JavaScript numbers lose digits above 2^53).
 
@@ -98,9 +100,10 @@ api /v1/conflicts/ffffffff-.../resolve -X POST
 
 | Status | Codes |
 | --- | --- |
-| 400 | `bad_request`, `invalid`, `schema`, `sql` |
+| 400 | `bad_request`, `invalid`, `schema`, `sql`, `limit` |
 | 404 | `not_found` |
 | 405 | `method_not_allowed` |
+| 413 | `too_large` |
 | 409 | `constraint` |
 | 503 | `clock`, `unavailable` |
 | 500 | `internal` |

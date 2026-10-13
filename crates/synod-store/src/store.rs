@@ -24,9 +24,11 @@
 //! write that did not commit is in neither.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Statement, params};
 use synod_core::log::{LogHeader, encode_log, log_hash};
 use synod_core::prolly::NodeHash;
 use synod_core::{Cell, Hlc, HlcClock, LogEntry, NodeId, Op, Row, RowHash, RowId, Stamp, TxnId, Value};
@@ -211,6 +213,29 @@ pub struct Store {
     // The root of the stored (base) tree as of the last refresh, while no
     // row changed since. Cleared at every rollback.
     pub(crate) hash_cache: Option<NodeHash>,
+    pub(crate) limits: QueryLimits,
+}
+
+/// Limits on the statements that callers give: queries, and the conditions
+/// of [`update_where`](Txn::update_where) and
+/// [`delete_where`](Txn::delete_where). None by default; a serving node
+/// sets them, as it runs every caller's statement on its own thread.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueryLimits {
+    /// A statement that runs longer fails with [`Error::Limit`].
+    pub time: Option<Duration>,
+    /// A query whose result is larger fails with [`Error::Limit`]: 8 bytes
+    /// for a number, the length of a text or blob.
+    pub max_bytes: Option<usize>,
+}
+
+fn value_bytes(v: &SqlValue) -> usize {
+    match v {
+        SqlValue::Null => 1,
+        SqlValue::Integer(_) | SqlValue::Real(_) => 8,
+        SqlValue::Text(t) => t.len(),
+        SqlValue::Blob(b) => b.len(),
+    }
 }
 
 pub(crate) fn sql_err(e: rusqlite::Error) -> Error {
@@ -318,7 +343,16 @@ impl Store {
         // a sealed epoch (specification Section 3.4).
         let epoch_start = hlc_at(config.genesis_ms + open_epoch as u64 * config.epoch_len_ms)?;
         let clock = HlcClock::resume(Hlc::from_u64(hlc_last as u64).max(epoch_start), config.max_drift_ms);
-        let mut store = Store { conn, path: path.to_owned(), env, config, clock, tables, hash_cache: None };
+        let mut store = Store {
+            conn,
+            path: path.to_owned(),
+            env,
+            config,
+            clock,
+            tables,
+            hash_cache: None,
+            limits: QueryLimits::default(),
+        };
         if store.tables.is_empty() {
             store.add_table(parse_system_table(crate::merge::CONFLICTS_DDL, 0)?)?;
         }
@@ -481,53 +515,119 @@ impl Store {
 
     /// Runs a read-only SQL statement and returns all result rows.
     ///
-    /// Read managed tables through their views. A statement that writes
-    /// is rejected.
+    /// Read managed tables through their views. The statement may only
+    /// read: a write, a transaction statement, `ATTACH`, or `PRAGMA` is
+    /// rejected. [`QueryLimits`] apply.
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Vec<SqlValue>>> {
-        let mut stmt = self.conn.prepare_cached(sql)?;
-        if !stmt.readonly() {
-            return Err(Error::Invalid("query() runs read-only statements only; use begin() to write".into()));
-        }
-        let n = stmt.column_count();
-        let params: Vec<SqlValue> = params.iter().map(values::to_sql).collect();
-        let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| (0..n).map(|i| r.get(i)).collect())?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut stmt = self.prepare_read(sql)?;
+        self.read_rows(&mut stmt, params)
     }
 
     /// As [`query`](Store::query), and also returns the column names.
     pub fn query_named(&self, sql: &str, params: &[Value]) -> Result<(Vec<String>, Vec<Vec<SqlValue>>)> {
-        let names = {
-            let stmt = self.conn.prepare_cached(sql)?;
-            stmt.column_names().into_iter().map(str::to_owned).collect()
-        };
-        Ok((names, self.query(sql, params)?))
+        let mut stmt = self.prepare_read(sql)?;
+        let names = stmt.column_names().into_iter().map(str::to_owned).collect();
+        Ok((names, self.read_rows(&mut stmt, params)?))
     }
 
     /// As [`query_named`](Store::query_named), and also gives where each
     /// result column comes from: a table's row ID, a table column (with its
     /// type), or neither (an expression).
     pub fn query_typed(&self, sql: &str, params: &[Value]) -> Result<(Vec<ResultColumn>, Vec<Vec<SqlValue>>)> {
-        let columns = {
-            let stmt = self.conn.prepare_cached(sql)?;
-            stmt.columns_with_metadata()
-                .iter()
-                .map(|m| {
-                    let table = m.table_name().and_then(|t| t.strip_prefix(PHYSICAL_PREFIX));
-                    let schema = table.and_then(|t| self.tables.iter().find(|s| s.name == t));
-                    let kind = match (schema, m.origin_name()) {
-                        (Some(_), Some("_row_id")) => ResultKind::RowId,
-                        (Some(s), Some(c)) => s
-                            .columns
-                            .iter()
-                            .find(|col| col.name == c)
-                            .map_or(ResultKind::Expression, |col| ResultKind::Column(col.ty.clone())),
-                        _ => ResultKind::Expression,
-                    };
-                    ResultColumn { name: m.name().to_owned(), kind }
-                })
-                .collect()
-        };
-        Ok((columns, self.query(sql, params)?))
+        let mut stmt = self.prepare_read(sql)?;
+        let columns = stmt
+            .columns_with_metadata()
+            .iter()
+            .map(|m| {
+                let table = m.table_name().and_then(|t| t.strip_prefix(PHYSICAL_PREFIX));
+                let schema = table.and_then(|t| self.tables.iter().find(|s| s.name == t));
+                let kind = match (schema, m.origin_name()) {
+                    (Some(_), Some("_row_id")) => ResultKind::RowId,
+                    (Some(s), Some(c)) => s
+                        .columns
+                        .iter()
+                        .find(|col| col.name == c)
+                        .map_or(ResultKind::Expression, |col| ResultKind::Column(col.ty.clone())),
+                    _ => ResultKind::Expression,
+                };
+                ResultColumn { name: m.name().to_owned(), kind }
+            })
+            .collect();
+        Ok((columns, self.read_rows(&mut stmt, params)?))
+    }
+
+    /// Sets the limits on callers' statements.
+    pub fn set_query_limits(&mut self, limits: QueryLimits) {
+        self.limits = limits;
+    }
+
+    /// Returns the limits on callers' statements.
+    pub fn query_limits(&self) -> QueryLimits {
+        self.limits
+    }
+
+    // Prepares a caller's statement that may only read. The authorizer
+    // sees each action as SQLite compiles the statement; `readonly()`
+    // alone lets BEGIN, SAVEPOINT, ATTACH, and some PRAGMAs through, and
+    // they would change the store's connection.
+    fn prepare_read(&self, sql: &str) -> Result<Statement<'_>> {
+        fn reads_only(ctx: AuthContext<'_>) -> Authorization {
+            match ctx.action {
+                AuthAction::Select | AuthAction::Read { .. } | AuthAction::Function { .. } | AuthAction::Recursive => {
+                    Authorization::Allow
+                }
+                _ => Authorization::Deny,
+            }
+        }
+        self.conn.authorizer(Some(reads_only))?;
+        let stmt = self.conn.prepare(sql);
+        self.conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+        let stmt = stmt.map_err(|e| match e.sqlite_error_code() {
+            Some(ErrorCode::AuthorizationForStatementDenied) => {
+                Error::Invalid(format!("a query may only read (SELECT): {sql}"))
+            }
+            _ => sql_err(e),
+        })?;
+        if !stmt.readonly() {
+            return Err(Error::Invalid("a query may only read (SELECT); use begin() to write".into()));
+        }
+        Ok(stmt)
+    }
+
+    // Runs a statement from `prepare_read` under the time limit.
+    fn timed<T>(&self, run: impl FnOnce() -> Result<T>) -> Result<T> {
+        let Some(time) = self.limits.time else { return run() };
+        let deadline = Instant::now() + time;
+        self.conn.progress_handler(1000, Some(move || Instant::now() >= deadline))?;
+        let r = run();
+        self.conn.progress_handler(0, None::<fn() -> bool>)?;
+        r.map_err(|e| match e {
+            Error::Sql(e) if e.sqlite_error_code() == Some(ErrorCode::OperationInterrupted) => {
+                Error::Limit(format!("the statement ran longer than {} ms", time.as_millis()))
+            }
+            e => e,
+        })
+    }
+
+    fn read_rows(&self, stmt: &mut Statement<'_>, params: &[Value]) -> Result<Vec<Vec<SqlValue>>> {
+        let n = stmt.column_count();
+        let params: Vec<SqlValue> = params.iter().map(values::to_sql).collect();
+        let max = self.limits.max_bytes;
+        self.timed(|| {
+            let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+            let (mut out, mut bytes) = (Vec::new(), 0usize);
+            while let Some(r) = rows.next()? {
+                let row: Vec<SqlValue> = (0..n).map(|i| r.get(i)).collect::<rusqlite::Result<_>>()?;
+                if let Some(max) = max {
+                    bytes += row.iter().map(value_bytes).sum::<usize>();
+                    if bytes > max {
+                        return Err(Error::Limit(format!("the result is larger than {max} bytes")));
+                    }
+                }
+                out.push(row);
+            }
+            Ok(out)
+        })
     }
 
     /// Returns the values of a live row.
@@ -1071,13 +1171,11 @@ impl Txn<'_> {
             "SELECT \"_row_id\" FROM \"{}\" WHERE \"_tomb\" = 0 AND ({condition}) ORDER BY \"_row_id\"",
             schema.physical()
         );
-        let mut stmt = self.store.conn.prepare_cached(&sql)?;
-        if !stmt.readonly() {
-            return Err(Error::Invalid("the condition must not write".into()));
-        }
+        let mut stmt = self.store.prepare_read(&sql)?;
         let params: Vec<SqlValue> = params.iter().map(values::to_sql).collect();
-        let ids: Vec<Vec<u8>> =
-            stmt.query_map(rusqlite::params_from_iter(params), |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let ids: Vec<Vec<u8>> = self.store.timed(|| {
+            Ok(stmt.query_map(rusqlite::params_from_iter(params), |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
+        })?;
         ids.iter().map(|b| parse_row_id(b)).collect()
     }
 

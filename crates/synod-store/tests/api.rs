@@ -5,9 +5,11 @@ mod common;
 
 use common::*;
 use rusqlite::types::Value as Sql;
+use std::time::{Duration, Instant};
 use synod_core::log::decode_log;
 use synod_core::{Op, Value, ValueSet};
-use synod_store::{Error, Store};
+
+use synod_store::{Error, QueryLimits, Store};
 
 fn store() -> (Node, Store) {
     let node = Node::new(7, 1);
@@ -252,4 +254,59 @@ fn put_row_writes_without_a_log_entry() {
     t.commit().unwrap();
     assert_eq!(s.all_entries().unwrap().len(), 2);
     assert_eq!(s.state_hash().unwrap(), s.state_hash_from_scratch().unwrap());
+}
+
+#[test]
+fn queries_only_read() {
+    // `readonly()` lets these through; they would change the store's
+    // connection (an open transaction stops every later write and seal).
+    let (_n, mut s) = store();
+    for sql in [
+        "BEGIN",
+        "SAVEPOINT x",
+        "ROLLBACK",
+        "ATTACH 'other.db' AS o",
+        "PRAGMA foreign_keys = OFF",
+        "PRAGMA synchronous = OFF",
+    ] {
+        let e = s.query(sql, &[]).unwrap_err();
+        assert!(matches!(e, Error::Invalid(_)), "{sql}: {e}");
+    }
+    // A condition cannot carry a second statement.
+    assert!(s.begin().unwrap().update_where("inventory", "1); BEGIN; SELECT (1", &[], &[]).is_err());
+    // Reads still work, with recursive CTEs and functions; so do writes.
+    let r = s.query(
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 3) SELECT sum(x), upper('a') FROM c",
+        &[],
+    );
+    assert_eq!(r.unwrap(), vec![vec![Sql::Integer(6), Sql::Text("A".into())]]);
+    let mut t = s.begin().unwrap();
+    t.insert("inventory", &part("A", 1)).unwrap();
+    assert_eq!(
+        t.update_where("inventory", "qty < ?1", &[Value::Integer(5)], &[("qty", Value::Integer(2))]).unwrap().len(),
+        1
+    );
+    t.commit().unwrap();
+}
+
+#[test]
+fn query_limits_stop_slow_and_large_queries() {
+    let (_n, mut s) = store();
+    let mut t = s.begin().unwrap();
+    t.insert("inventory", &part("A", 1)).unwrap();
+    t.commit().unwrap();
+    let forever = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c";
+    s.set_query_limits(QueryLimits { time: Some(Duration::from_millis(200)), max_bytes: Some(1000) });
+    let start = Instant::now();
+    assert!(matches!(s.query(forever, &[]), Err(Error::Limit(_))));
+    assert!(start.elapsed() < Duration::from_secs(5));
+    let cond = "qty < (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c)";
+    assert!(matches!(s.begin().unwrap().delete_where("inventory", cond, &[]), Err(Error::Limit(_))));
+    let big = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 200) SELECT x FROM c";
+    assert!(matches!(s.query(big, &[]), Err(Error::Limit(_))));
+    // The store goes on as before.
+    let mut t = s.begin().unwrap();
+    t.insert("inventory", &part("B", 1)).unwrap();
+    t.commit().unwrap();
+    assert_eq!(s.query("SELECT count(*) FROM inventory", &[]).unwrap(), vec![vec![Sql::Integer(2)]]);
 }

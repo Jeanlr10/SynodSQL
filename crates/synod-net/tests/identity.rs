@@ -32,7 +32,13 @@ fn messages_need_the_senders_certificate() {
         vec![Member { id: NodeId(1), addr: addr.to_string() }, Member { id: NodeId(2), addr: "127.0.0.1:1".into() }];
     let peer = Peer::new(store, PeerConfig::new(ids.to_vec(), 1_000)).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
-    let cfg = ServeConfig { listen: addr, members, tls: tls(&certs, "node-1", &certs.ca_pem), tick_ms: 50 };
+    let cfg = ServeConfig {
+        listen: addr,
+        members,
+        tls: tls(&certs, "node-1", &certs.ca_pem),
+        tick_ms: 50,
+        query_limits: synod_net::DEFAULT_QUERY_LIMITS,
+    };
     let s = stop.clone();
     let server = std::thread::spawn(move || synod_net::serve(peer, cfg, Box::new(|_, _| Ok("ok".into())), s));
     let to = Member { id: NodeId(1), addr: addr.to_string() };

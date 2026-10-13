@@ -31,6 +31,9 @@ pub enum Error {
     },
     /// Stored data is not valid.
     Corrupt(String),
+    /// A caller's statement went over a [`QueryLimits`](crate::QueryLimits)
+    /// limit.
+    Limit(String),
 }
 
 impl fmt::Display for Error {
@@ -46,6 +49,7 @@ impl fmt::Display for Error {
                 write!(f, "epoch {epoch} ends at {ends_at_ms} ms; it cannot be sealed yet")
             }
             Error::Corrupt(m) => write!(f, "corrupt data: {m}"),
+            Error::Limit(m) => write!(f, "limit: {m}"),
         }
     }
 }

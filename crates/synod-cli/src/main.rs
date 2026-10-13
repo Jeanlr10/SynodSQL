@@ -40,8 +40,9 @@ Cluster (HTTP/2 with mutual TLS):
                                        make a cluster CA and certificates; --hosts
                                        also names nodes by host or IP, for HTTP clients
   serve <db> --listen <addr> --peers <id=host:port,...> --certs <dir>
-        [--tick-ms <ms>] [--no-quorum] [--gossip <k>]
-                                       run the node: seal, exchange logs, merge
+        [--tick-ms <ms>] [--no-quorum] [--gossip <k>] [--query-ms <ms>] [--result-mb <MiB>]
+                                       run the node: seal, exchange logs, merge;
+                                       a query stops after 5000 ms or 64 MiB (0: no limit)
   remote <host:port> --to <id> --certs <dir> [--as <name>] <command> [arguments]
                                        run a store command (without <db>) on a
                                        running node; also net-status, metrics
@@ -185,7 +186,7 @@ fn run(args: &[String]) -> R<()> {
             println!("wrote the CA and {issued} certificates to {dir}");
         }
         "serve" => {
-            a.known(&["listen", "peers", "certs", "tick-ms", "no-quorum", "gossip"])?;
+            a.known(&["listen", "peers", "certs", "tick-ms", "no-quorum", "gossip", "query-ms", "result-mb"])?;
             let store = open(a.at(0, "<db>")?)?;
             let me = store.config().node;
             let listen = a.opt("listen").ok_or("serve needs --listen <addr>")?;
@@ -211,7 +212,14 @@ fn run(args: &[String]) -> R<()> {
             let peer = synod_node::Peer::new(store, cfg).map_err(err)?;
             println!("node {me} serving on {listen} with {} members", members.len());
             let exec: synod_net::ExecFn = Box::new(synodsql::command::run);
-            let config = synod_net::ServeConfig { listen, members, tls, tick_ms };
+            let d = synod_net::DEFAULT_QUERY_LIMITS;
+            let query_ms = a.num("query-ms", d.time.map_or(0, |t| t.as_millis() as u64))?;
+            let result_mb = a.num("result-mb", d.max_bytes.map_or(0, |b| (b >> 20) as u64))?;
+            let query_limits = synod_net::QueryLimits {
+                time: (query_ms > 0).then(|| std::time::Duration::from_millis(query_ms)),
+                max_bytes: (result_mb > 0).then_some((result_mb as usize) << 20),
+            };
+            let config = synod_net::ServeConfig { listen, members, tls, tick_ms, query_limits };
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             synod_net::serve(peer, config, exec, stop).map_err(|e| e.to_string())?;
         }

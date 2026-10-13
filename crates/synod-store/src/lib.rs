@@ -47,5 +47,5 @@ pub mod values;
 
 pub use env::{Clock, Env, FileSystem, ManualClock, OsFs, SystemClock};
 pub use error::{Error, Result};
-pub use store::{Commit, ResultColumn, ResultKind, STORE_FORMAT, SealedLog, Store, StoreConfig, Txn};
+pub use store::{Commit, QueryLimits, ResultColumn, ResultKind, STORE_FORMAT, SealedLog, Store, StoreConfig, Txn};
 pub use sync::{BaseImage, BaseRow, MergeReport, MergedLog, MergedRecord, RevertReport};
