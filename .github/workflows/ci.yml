@@ -46,6 +46,11 @@ jobs:
       PROPTEST_CASES: 2000
       # Phase 2 exit gate: 100,000 random merge histories.
       SYNOD_MERGE_RUNS: 100000
+      # Phase 3 exit gate: 5 nodes for 10,000 epochs, 50 nodes for 300
+      # epochs, and random clusters of 5 to 12 nodes.
+      SYNOD_GATE_EPOCHS: 10000
+      SYNOD_GATE50_EPOCHS: 300
+      SYNOD_CLUSTER_RUNS: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

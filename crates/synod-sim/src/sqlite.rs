@@ -120,12 +120,36 @@ impl State {
         for op in self.dir_pending.drain(..) {
             op.apply(&mut self.durable_names);
         }
+        self.collect();
     }
 
+    // Frees the data of files that no name refers to, now or after a
+    // crash, and that are not open.
+    fn collect(&mut self) {
+        let mut used = vec![false; self.inodes.len()];
+        for &ino in self.live_names.values().chain(self.durable_names.values()) {
+            used[ino] = true;
+        }
+        for op in &self.dir_pending {
+            if let DirOp::Link(_, ino) = op {
+                used[*ino] = true;
+            }
+        }
+        for (ino, inode) in self.inodes.iter_mut().enumerate() {
+            if !used[ino] && inode.open == 0 && (!inode.live.is_empty() || !inode.durable.is_empty()) {
+                *inode = Inode::default();
+            }
+        }
+    }
+
+    // The durable content plus the pending operations is the live
+    // content, so a sync applies the pending operations.
     fn sync_inode(&mut self, ino: usize) {
         let inode = &mut self.inodes[ino];
-        inode.durable = inode.live.clone();
-        inode.pending.clear();
+        for op in inode.pending.drain(..) {
+            op.apply(&mut inode.durable);
+        }
+        debug_assert_eq!(inode.durable.len(), inode.live.len());
         self.sync_dir();
     }
 }
@@ -270,6 +294,7 @@ impl CrashFs {
         s.live_names = s.durable_names.clone();
         s.dead = false;
         s.die_at = None;
+        s.collect();
     }
 
     /// Returns true if a file exists.
@@ -489,6 +514,7 @@ unsafe extern "C" fn x_close(file: *mut ffi::sqlite3_file) -> c_int {
                 s.dir_pending.push(DirOp::Unlink(*name));
             }
         }
+        s.collect();
         ffi::SQLITE_OK
     }
 }

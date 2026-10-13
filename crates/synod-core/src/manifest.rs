@@ -38,6 +38,9 @@ pub struct Manifest {
     pub rank: u32,
     /// The leader.
     pub leader: NodeId,
+    /// Hash of the manifest of the previous merge, M(e−1); all zeros for
+    /// the first merge. The manifests form a chain, as git commits do.
+    pub parent: [u8; 32],
     /// Garbage collection through this epoch (specification Section 7.7).
     pub gc_through: Option<u64>,
     /// The logs, sorted by (node, epoch), at most one per (node, epoch).
@@ -46,10 +49,23 @@ pub struct Manifest {
 
 impl Manifest {
     /// Makes a manifest; sorts the logs.
-    pub fn new(epoch: u64, rank: u32, leader: NodeId, gc_through: Option<u64>, mut logs: Vec<LogRef>) -> Manifest {
+    pub fn new(
+        epoch: u64,
+        rank: u32,
+        leader: NodeId,
+        parent: [u8; 32],
+        gc_through: Option<u64>,
+        mut logs: Vec<LogRef>,
+    ) -> Manifest {
         logs.sort();
         logs.dedup();
-        Manifest { epoch, rank, leader, gc_through, logs }
+        Manifest { epoch, rank, leader, parent, gc_through, logs }
+    }
+
+    /// The priority order between manifests of one epoch on one parent:
+    /// the lower rank first, then the lower hash (specification Section 6).
+    pub fn priority(&self) -> (u32, [u8; 32]) {
+        (self.rank, self.hash())
     }
 
     /// Returns the canonical encoding.
@@ -59,6 +75,7 @@ impl Manifest {
         out.extend_from_slice(&self.epoch.to_be_bytes());
         out.extend_from_slice(&self.rank.to_be_bytes());
         out.extend_from_slice(&self.leader.0.to_be_bytes());
+        out.extend_from_slice(&self.parent);
         match self.gc_through {
             None => out.push(0),
             Some(e) => {
@@ -93,6 +110,7 @@ impl Manifest {
         let epoch = u64_at(take(8)?);
         let rank = u32_at(take(4)?);
         let leader = NodeId(u32_at(take(4)?));
+        let parent: [u8; 32] = take(32)?.try_into().unwrap();
         let gc_through = match take(1)?[0] {
             0 => None,
             1 => Some(u64_at(take(8)?)),
@@ -113,7 +131,7 @@ impl Manifest {
         if !ordered || logs.iter().any(|l| l.epoch > epoch) {
             return Err(LogError::BadHeader);
         }
-        Ok(Manifest { epoch, rank, leader, gc_through, logs })
+        Ok(Manifest { epoch, rank, leader, parent, gc_through, logs })
     }
 
     /// Returns the manifest hash.
@@ -143,7 +161,7 @@ mod tests {
     #[test]
     fn round_trip_and_rules() {
         let r = |n: u32, e: u64| LogRef { node: NodeId(n), epoch: e, hash: [n as u8; 32] };
-        let m = Manifest::new(9, 1, NodeId(3), Some(1), vec![r(2, 9), r(1, 8), r(1, 9), r(1, 9)]);
+        let m = Manifest::new(9, 1, NodeId(3), [7; 32], Some(1), vec![r(2, 9), r(1, 8), r(1, 9), r(1, 9)]);
         assert_eq!(m.logs, vec![r(1, 8), r(1, 9), r(2, 9)]);
         assert_eq!(Manifest::decode(&m.encode()).unwrap(), m);
         let bad = Manifest { logs: vec![r(2, 9), r(1, 9)], ..m.clone() };
@@ -151,6 +169,7 @@ mod tests {
         let future = Manifest { logs: vec![r(1, 10)], ..m.clone() };
         assert!(Manifest::decode(&future.encode()).is_err());
         assert_ne!(m.hash(), Manifest { rank: 0, ..m.clone() }.hash());
+        assert_ne!(m.hash(), Manifest { parent: [0; 32], ..m.clone() }.hash());
         let members = [NodeId(1), NodeId(5), NodeId(9)];
         assert_eq!([0, 1, 2, 3].map(|k| leader(&members, 7, k)), [NodeId(5), NodeId(9), NodeId(1), NodeId(5)]);
     }

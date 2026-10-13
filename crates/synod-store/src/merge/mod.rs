@@ -24,7 +24,7 @@ use synod_core::{Cell, LogEntry, NodeId, Op, Row, RowId, Stamp, Value};
 
 pub use conflict::{
     CONFLICT_ID_CONTEXT, CONFLICTS_DDL, CONFLICTS_TABLE, Conflict, ConflictKind, MERGE_NODE, Recorded, conflict_id,
-    decode_image, decode_recorded, encode_image, encode_recorded,
+    decode_image, decode_recorded, encode_image, encode_recorded, given_up_id,
 };
 pub use mem::MemState;
 
@@ -392,18 +392,17 @@ pub(crate) fn failed_checks(conn: &Connection, schema: &TableSchema, row: &Row) 
     ))?;
     let marks: Vec<String> = (1..=schema.columns.len()).map(|i| format!("?{i}")).collect();
     let args: Vec<SqlValue> = row.cells.iter().map(|c| values::to_sql(&c.value)).collect();
-    conn.execute(
-        &format!("INSERT INTO temp.\"{temp}\" VALUES ({})", marks.join(", ")),
-        rusqlite::params_from_iter(args),
-    )?;
+    conn.prepare_cached(&format!("INSERT INTO temp.\"{temp}\" VALUES ({})", marks.join(", ")))?
+        .execute(rusqlite::params_from_iter(args))?;
     let mut failed = Vec::new();
     for (i, check) in schema.checks.iter().enumerate() {
-        let n: i64 =
-            conn.query_row(&format!("SELECT count(*) FROM temp.\"{temp}\" WHERE NOT ({check})"), [], |r| r.get(0))?;
+        let n: i64 = conn
+            .prepare_cached(&format!("SELECT count(*) FROM temp.\"{temp}\" WHERE NOT ({check})"))?
+            .query_row([], |r| r.get(0))?;
         if n > 0 {
             failed.push(i);
         }
     }
-    conn.execute(&format!("DELETE FROM temp.\"{temp}\""), [])?;
+    conn.prepare_cached(&format!("DELETE FROM temp.\"{temp}\""))?.execute([])?;
     Ok(failed)
 }

@@ -97,7 +97,8 @@ CREATE TABLE _synod_merged (
     rank INTEGER NOT NULL,
     base_before BLOB NOT NULL,
     root BLOB NOT NULL,
-    conflicts INTEGER NOT NULL
+    conflicts INTEGER NOT NULL,
+    undoable INTEGER NOT NULL
 ) STRICT;
 CREATE TABLE _synod_logs (
     log_hash BLOB PRIMARY KEY,
@@ -107,6 +108,7 @@ CREATE TABLE _synod_logs (
     abandoned INTEGER NOT NULL DEFAULT 0
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX _synod_logs_epoch ON _synod_logs (epoch, node);
+CREATE INDEX _synod_logs_node ON _synod_logs (node, epoch);
 CREATE TABLE _synod_merge_undo (
     epoch INTEGER NOT NULL,
     row_id BLOB NOT NULL,
@@ -170,6 +172,8 @@ pub struct Commit {
     pub hlc: Hlc,
     /// Epoch whose log holds the transaction.
     pub epoch: u64,
+    /// Number of log entries (changed rows); 0 if nothing changed.
+    pub entries: u64,
 }
 
 /// A SynodSQL node store on SQLite.
@@ -180,6 +184,9 @@ pub struct Store {
     pub(crate) config: StoreConfig,
     pub(crate) clock: HlcClock,
     pub(crate) tables: Vec<Arc<TableSchema>>,
+    // The state hash as of the last refresh, while no row changed since.
+    // Cleared at every rollback.
+    pub(crate) hash_cache: Option<NodeHash>,
 }
 
 pub(crate) fn sql_err(e: rusqlite::Error) -> Error {
@@ -217,44 +224,39 @@ impl Store {
             Some(vfs) => Connection::open_with_flags_and_vfs(path, flags, vfs)?,
             None => Connection::open_with_flags(path, flags)?,
         };
-        let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+        conn.set_prepared_statement_cache_capacity(256);
+        let mode: String = conn.prepare_cached("PRAGMA journal_mode = WAL")?.query_row([], |r| r.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
             return Err(Error::Invalid(format!("journal mode {mode} instead of WAL")));
         }
         conn.execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = OFF;")?;
 
-        let exists: bool = conn.query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = '_synod_node'",
-            [],
-            |r| r.get::<_, i64>(0).map(|n| n > 0),
-        )?;
+        let exists: bool = conn
+            .prepare_cached("SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = '_synod_node'")?
+            .query_row([], |r| r.get::<_, i64>(0).map(|n| n > 0))?;
         if !exists {
             let now = env.clock.now_ms();
             let open_epoch = now.saturating_sub(config.genesis_ms) / config.epoch_len_ms;
             conn.execute_batch(&format!("BEGIN IMMEDIATE; {SETUP}"))?;
-            conn.execute(
+            conn.prepare_cached(
                 "INSERT INTO _synod_node VALUES (0, ?1, ?2, ?3, ?4, ?5, 0, 0, 0, ?6, ?7, 0, ?6, NULL, ?8)",
-                params![
-                    STORE_FORMAT,
-                    config.node.0,
-                    config.genesis_ms as i64,
-                    config.epoch_len_ms as i64,
-                    config.max_drift_ms as i64,
-                    open_epoch as i64,
-                    synod_core::prolly::empty_root().to_vec(),
-                    config.lateness as i64,
-                ],
-            )?;
-            conn.execute(
-                "INSERT INTO _synod_tree (hash, node) VALUES (?1, ?2)",
-                params![synod_core::prolly::empty_root().to_vec(), vec![0u8; 5]],
-            )?;
+            )?
+            .execute(params![
+                STORE_FORMAT,
+                config.node.0,
+                config.genesis_ms as i64,
+                config.epoch_len_ms as i64,
+                config.max_drift_ms as i64,
+                open_epoch as i64,
+                synod_core::prolly::empty_root().to_vec(),
+                config.lateness as i64,
+            ])?;
+            conn.prepare_cached("INSERT INTO _synod_tree (hash, node) VALUES (?1, ?2)")?
+                .execute(params![synod_core::prolly::empty_root().to_vec(), vec![0u8; 5]])?;
             conn.execute_batch("COMMIT")?;
         }
         let (format, node, genesis, len, drift, hlc_last, open_epoch, lateness): (i64, u32, i64, i64, i64, i64, i64, i64) =
-            conn.query_row(
-                "SELECT format, node, genesis_ms, epoch_len_ms, max_drift_ms, hlc_last, open_epoch, lateness FROM _synod_node",
-                [],
+            conn.prepare_cached("SELECT format, node, genesis_ms, epoch_len_ms, max_drift_ms, hlc_last, open_epoch, lateness FROM _synod_node")?.query_row([],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
             )?;
         if format != STORE_FORMAT {
@@ -273,7 +275,7 @@ impl Store {
 
         let mut tables = Vec::new();
         {
-            let mut stmt = conn.prepare("SELECT table_id, ddl FROM _synod_schema ORDER BY table_id")?;
+            let mut stmt = conn.prepare_cached("SELECT table_id, ddl FROM _synod_schema ORDER BY table_id")?;
             let rows = stmt.query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?)))?;
             for row in rows {
                 let (id, ddl) = row?;
@@ -289,7 +291,7 @@ impl Store {
         // a sealed epoch (specification Section 3.4).
         let epoch_start = hlc_at(config.genesis_ms + open_epoch as u64 * config.epoch_len_ms)?;
         let clock = HlcClock::resume(Hlc::from_u64(hlc_last as u64).max(epoch_start), config.max_drift_ms);
-        let mut store = Store { conn, path: path.to_owned(), env, config, clock, tables };
+        let mut store = Store { conn, path: path.to_owned(), env, config, clock, tables, hash_cache: None };
         if store.tables.is_empty() {
             store.add_table(parse_system_table(crate::merge::CONFLICTS_DDL, 0)?)?;
         }
@@ -362,12 +364,14 @@ impl Store {
 
     /// Returns the lowest epoch that is not sealed.
     pub fn open_epoch(&self) -> Result<u64> {
-        Ok(self.conn.query_row("SELECT open_epoch FROM _synod_node", [], |r| r.get::<_, i64>(0))? as u64)
+        Ok(self.conn.prepare_cached("SELECT open_epoch FROM _synod_node")?.query_row([], |r| r.get::<_, i64>(0))?
+            as u64)
     }
 
     /// Returns the root hash of the base state M(e−1).
     pub fn base_root(&self) -> Result<NodeHash> {
-        let root: Vec<u8> = self.conn.query_row("SELECT base_root FROM _synod_node", [], |r| r.get(0))?;
+        let root: Vec<u8> =
+            self.conn.prepare_cached("SELECT base_root FROM _synod_node")?.query_row([], |r| r.get(0))?;
         root.try_into().map_err(|_| Error::Corrupt("base_root is not 32 bytes".into()))
     }
 
@@ -391,7 +395,7 @@ impl Store {
             }
         }
         for (column, default) in schema.columns.iter().filter_map(|c| c.default.as_ref().map(|d| (c, d))) {
-            let raw: SqlValue = self.conn.query_row(&format!("SELECT {default}"), [], |r| r.get(0))?;
+            let raw: SqlValue = self.conn.prepare_cached(&format!("SELECT {default}"))?.query_row([], |r| r.get(0))?;
             values::from_expression(column, (&raw).into())?;
         }
         let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -413,9 +417,10 @@ impl Store {
         let hlc = self.clock.now(self.env.clock.now_ms())?;
         let epoch = self.epoch_of(hlc);
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let read = self.conn.query_row("SELECT next_row, next_txn, open_epoch FROM _synod_node", [], |r| {
-            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64))
-        });
+        let read =
+            self.conn.prepare_cached("SELECT next_row, next_txn, open_epoch FROM _synod_node")?.query_row([], |r| {
+                Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64))
+            });
         let (next_row, next_txn, open_epoch) = match read {
             Ok(v) => v,
             Err(e) => {
@@ -428,6 +433,7 @@ impl Store {
             hlc,
             epoch,
             next_row,
+            entries: 0,
             store: self,
             done: false,
         };
@@ -442,7 +448,7 @@ impl Store {
     /// Read managed tables through their views. A statement that writes
     /// is rejected.
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Vec<SqlValue>>> {
-        let mut stmt = self.conn.prepare(sql)?;
+        let mut stmt = self.conn.prepare_cached(sql)?;
         if !stmt.readonly() {
             return Err(Error::Invalid("query() runs read-only statements only; use begin() to write".into()));
         }
@@ -455,7 +461,7 @@ impl Store {
     /// As [`query`](Store::query), and also returns the column names.
     pub fn query_named(&self, sql: &str, params: &[Value]) -> Result<(Vec<String>, Vec<Vec<SqlValue>>)> {
         let names = {
-            let stmt = self.conn.prepare(sql)?;
+            let stmt = self.conn.prepare_cached(sql)?;
             stmt.column_names().into_iter().map(str::to_owned).collect()
         };
         Ok((names, self.query(sql, params)?))
@@ -485,7 +491,7 @@ impl Store {
     }
 
     fn entries_where(&self, cond: &str, arg: u64) -> Result<Vec<LogEntry>> {
-        let mut stmt = self.conn.prepare(&format!("SELECT entry FROM _synod_log WHERE {cond} ORDER BY seq"))?;
+        let mut stmt = self.conn.prepare_cached(&format!("SELECT entry FROM _synod_log WHERE {cond} ORDER BY seq"))?;
         let rows = stmt.query_map([arg as i64], |r| r.get::<_, Vec<u8>>(0))?;
         rows.map(|b| LogEntry::decode(&b?).map_err(|e| Error::Corrupt(format!("log entry: {e}")))).collect()
     }
@@ -527,7 +533,8 @@ impl Store {
         let sealed_at = self.clock.now(now)?;
         self.in_txn(|s| {
             let root = s.refresh_state_hash()?;
-            let base_root: Vec<u8> = s.conn.query_row("SELECT base_root FROM _synod_node", [], |r| r.get(0))?;
+            let base_root: Vec<u8> =
+                s.conn.prepare_cached("SELECT base_root FROM _synod_node")?.query_row([], |r| r.get(0))?;
             let header = LogHeader {
                 node: s.config.node,
                 epoch,
@@ -537,23 +544,24 @@ impl Store {
                 sealed_at,
             };
             let bodies: Vec<Vec<u8>> = {
-                let mut stmt = s.conn.prepare("SELECT entry FROM _synod_log WHERE epoch = ?1 ORDER BY seq")?;
+                let mut stmt = s.conn.prepare_cached("SELECT entry FROM _synod_log WHERE epoch = ?1 ORDER BY seq")?;
                 stmt.query_map([epoch as i64], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
             };
             let bytes = encode_log(&header, bodies.iter().map(Vec::as_slice));
             let hash = log_hash(&bytes);
-            s.conn.execute(
-                "INSERT INTO _synod_sealed (epoch, log_hash, log, entries, root) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![epoch as i64, hash.to_vec(), bytes, bodies.len() as i64, root.to_vec()],
-            )?;
-            s.conn.execute(
-                "INSERT OR IGNORE INTO _synod_logs (log_hash, node, epoch, log) VALUES (?1, ?2, ?3, ?4)",
-                params![hash.to_vec(), s.config.node.0, epoch as i64, bytes],
-            )?;
-            s.conn.execute(
-                "UPDATE _synod_node SET open_epoch = ?1, hlc_last = max(hlc_last, ?2)",
-                params![(epoch + 1) as i64, sealed_at.as_u64() as i64],
-            )?;
+            s.conn
+                .prepare_cached(
+                    "INSERT INTO _synod_sealed (epoch, log_hash, log, entries, root) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?
+                .execute(params![epoch as i64, hash.to_vec(), bytes, bodies.len() as i64, root.to_vec()])?;
+            s.conn
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO _synod_logs (log_hash, node, epoch, log) VALUES (?1, ?2, ?3, ?4)",
+                )?
+                .execute(params![hash.to_vec(), s.config.node.0, epoch as i64, bytes])?;
+            s.conn
+                .prepare_cached("UPDATE _synod_node SET open_epoch = ?1, hlc_last = max(hlc_last, ?2)")?
+                .execute(params![(epoch + 1) as i64, sealed_at.as_u64() as i64])?;
             Ok(SealedLog { epoch, hash, bytes, entries: bodies.len() as u64, root })
         })
     }
@@ -569,7 +577,7 @@ impl Store {
     pub fn state_hash_from_scratch(&self) -> Result<NodeHash> {
         let mut items: Vec<(RowId, RowHash)> = Vec::new();
         for schema in &self.tables {
-            let mut stmt = self.conn.prepare(&format!("SELECT \"_row_id\" FROM \"{}\"", schema.physical()))?;
+            let mut stmt = self.conn.prepare_cached(&format!("SELECT \"_row_id\" FROM \"{}\"", schema.physical()))?;
             let ids: Vec<Vec<u8>> = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
             for id in ids {
                 let row_id = parse_row_id(&id)?;
@@ -584,31 +592,38 @@ impl Store {
     // Updates the row hash of every row that a log entry touched since the
     // last update, then builds the tree. Runs inside a transaction.
     pub(crate) fn refresh_state_hash(&mut self) -> Result<NodeHash> {
-        let hashed: i64 = self.conn.query_row("SELECT hashed_seq FROM _synod_node", [], |r| r.get(0))?;
+        let hashed: i64 =
+            self.conn.prepare_cached("SELECT hashed_seq FROM _synod_node")?.query_row([], |r| r.get(0))?;
         let touched: Vec<(u32, Vec<u8>, i64)> = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = self.conn.prepare_cached(
                 "SELECT tbl, row_id, max(seq) FROM _synod_log WHERE seq > ?1 GROUP BY tbl, row_id
                  UNION ALL SELECT tbl, row_id, 0 FROM _synod_dirty ORDER BY 2",
             )?;
             stmt.query_map([hashed], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?
         };
+        if touched.is_empty()
+            && let Some(root) = self.hash_cache
+        {
+            return Ok(root);
+        }
+        self.hash_cache = None;
         let mut max_seq = hashed;
         for (tbl, id, seq) in touched {
             let schema = self.tables.get(tbl as usize).ok_or_else(|| Error::Corrupt(format!("table ID {tbl}")))?;
             match read_row(&self.conn, schema, parse_row_id(&id)?)? {
-                Some(row) => self.conn.execute(
-                    "INSERT OR REPLACE INTO _synod_rowhash (row_id, hash) VALUES (?1, ?2)",
-                    params![id, row.hash().0.to_vec()],
-                )?,
+                Some(row) => self
+                    .conn
+                    .prepare_cached("INSERT OR REPLACE INTO _synod_rowhash (row_id, hash) VALUES (?1, ?2)")?
+                    .execute(params![id, row.hash().0.to_vec()])?,
                 // A restore of the base state removed it.
-                None => self.conn.execute("DELETE FROM _synod_rowhash WHERE row_id = ?1", [id])?,
+                None => self.conn.prepare_cached("DELETE FROM _synod_rowhash WHERE row_id = ?1")?.execute([id])?,
             };
             max_seq = max_seq.max(seq);
         }
-        self.conn.execute("UPDATE _synod_node SET hashed_seq = ?1", [max_seq])?;
-        self.conn.execute("DELETE FROM _synod_dirty", [])?;
+        self.conn.prepare_cached("UPDATE _synod_node SET hashed_seq = ?1")?.execute([max_seq])?;
+        self.conn.prepare_cached("DELETE FROM _synod_dirty")?.execute([])?;
         let mut builder = TreeBuilder::new();
-        let mut stmt = self.conn.prepare("SELECT row_id, hash FROM _synod_rowhash ORDER BY row_id")?;
+        let mut stmt = self.conn.prepare_cached("SELECT row_id, hash FROM _synod_rowhash ORDER BY row_id")?;
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
             let id = parse_row_id(&r.get::<_, Vec<u8>>(0)?)?;
@@ -616,7 +631,9 @@ impl Store {
                 r.get::<_, Vec<u8>>(1)?.try_into().map_err(|_| Error::Corrupt("row hash is not 32 bytes".into()))?;
             builder.push(id, RowHash(hash));
         }
-        Ok(builder.finish())
+        let root = builder.finish();
+        self.hash_cache = Some(root);
+        Ok(root)
     }
 
     pub(crate) fn in_txn<T>(&mut self, f: impl FnOnce(&mut Store) -> Result<T>) -> Result<T> {
@@ -625,12 +642,14 @@ impl Store {
             Ok(v) => {
                 if let Err(e) = self.conn.execute_batch("COMMIT") {
                     let _ = self.conn.execute_batch("ROLLBACK");
+                    self.hash_cache = None;
                     return Err(e.into());
                 }
                 Ok(v)
             }
             Err(e) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
+                self.hash_cache = None;
                 Err(e)
             }
         }
@@ -648,7 +667,7 @@ impl Store {
         if self.env.fs.exists(&next)? {
             self.env.fs.remove(&next)?;
         }
-        self.conn.execute("VACUUM INTO ?1", [&next])?;
+        self.conn.prepare_cached("VACUUM INTO ?1")?.execute([&next])?;
         self.install(&next)
     }
 
@@ -792,6 +811,7 @@ pub struct Txn<'a> {
     hlc: Hlc,
     epoch: u64,
     next_row: u64,
+    entries: u64,
     done: bool,
 }
 
@@ -821,7 +841,7 @@ impl Txn<'_> {
     // Runs one operation in a savepoint, so that a failed operation leaves
     // no trace and the transaction can go on.
     fn op<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        let next_row = self.next_row;
+        let (next_row, entries) = (self.next_row, self.entries);
         self.store.conn.execute_batch("SAVEPOINT synod_op")?;
         match f(self) {
             Ok(v) => {
@@ -829,7 +849,7 @@ impl Txn<'_> {
                 Ok(v)
             }
             Err(e) => {
-                self.next_row = next_row;
+                (self.next_row, self.entries) = (next_row, entries);
                 self.store.conn.execute_batch("ROLLBACK TO synod_op; RELEASE synod_op")?;
                 Err(e)
             }
@@ -853,7 +873,8 @@ impl Txn<'_> {
                 let value = match (value, &column.default) {
                     (Some(v), _) => values::check(column, v)?,
                     (None, Some(default)) => {
-                        let raw: SqlValue = t.store.conn.query_row(&format!("SELECT {default}"), [], |r| r.get(0))?;
+                        let raw: SqlValue =
+                            t.store.conn.prepare_cached(&format!("SELECT {default}"))?.query_row([], |r| r.get(0))?;
                         values::from_expression(column, (&raw).into())?
                     }
                     (None, None) => values::check(column, Value::Null)?,
@@ -951,7 +972,7 @@ impl Txn<'_> {
             "SELECT \"_row_id\" FROM \"{}\" WHERE \"_tomb\" = 0 AND ({condition}) ORDER BY \"_row_id\"",
             schema.physical()
         );
-        let mut stmt = self.store.conn.prepare(&sql)?;
+        let mut stmt = self.store.conn.prepare_cached(&sql)?;
         if !stmt.readonly() {
             return Err(Error::Invalid("the condition must not write".into()));
         }
@@ -1008,13 +1029,13 @@ impl Txn<'_> {
 
     /// Commits the transaction.
     pub fn commit(mut self) -> Result<Commit> {
-        self.store.conn.execute(
-            "UPDATE _synod_node SET next_row = ?1, next_txn = ?2, hlc_last = max(hlc_last, ?3)",
-            params![self.next_row as i64, (self.txn.counter + 1) as i64, self.hlc.as_u64() as i64],
-        )?;
+        self.store
+            .conn
+            .prepare_cached("UPDATE _synod_node SET next_row = ?1, next_txn = ?2, hlc_last = max(hlc_last, ?3)")?
+            .execute(params![self.next_row as i64, (self.txn.counter + 1) as i64, self.hlc.as_u64() as i64])?;
         self.store.conn.execute_batch("COMMIT")?;
         self.done = true;
-        Ok(Commit { txn: self.txn, hlc: self.hlc, epoch: self.epoch })
+        Ok(Commit { txn: self.txn, hlc: self.hlc, epoch: self.epoch, entries: self.entries })
     }
 
     fn live_row(&self, schema: &TableSchema, row_id: RowId) -> Result<Row> {
@@ -1036,6 +1057,7 @@ impl Txn<'_> {
             .conn
             .prepare_cached("INSERT INTO _synod_log (epoch, tbl, row_id, entry) VALUES (?1, ?2, ?3, ?4)")?
             .execute(params![self.epoch as i64, schema.id, row_id.to_be_bytes().to_vec(), entry.encode()])?;
+        self.entries += 1;
         Ok(())
     }
 
@@ -1045,7 +1067,8 @@ impl Txn<'_> {
         for check in &schema.checks {
             let sql =
                 format!("SELECT count(*) FROM \"{}\" WHERE \"_row_id\" = ?1 AND NOT ({check})", schema.physical());
-            let failed: i64 = self.store.conn.query_row(&sql, [row_id.to_be_bytes().to_vec()], |r| r.get(0))?;
+            let failed: i64 =
+                self.store.conn.prepare_cached(&sql)?.query_row([row_id.to_be_bytes().to_vec()], |r| r.get(0))?;
             if failed > 0 {
                 return Err(Error::Constraint(format!("CHECK ({check}) failed on {}", schema.name)));
             }
@@ -1066,7 +1089,7 @@ impl Txn<'_> {
                 parent.physical(),
                 fk.parent_column
             );
-            let found: i64 = self.store.conn.query_row(&sql, [values::to_sql(value)], |r| r.get(0))?;
+            let found: i64 = self.store.conn.prepare_cached(&sql)?.query_row([values::to_sql(value)], |r| r.get(0))?;
             if found == 0 {
                 return Err(Error::Constraint(format!(
                     "{}.{} = {value:?} has no parent in {}",
@@ -1098,7 +1121,7 @@ impl Txn<'_> {
                     child.columns[fk.column].name
                 );
                 let ids: Vec<Vec<u8>> = {
-                    let mut stmt = self.store.conn.prepare(&sql)?;
+                    let mut stmt = self.store.conn.prepare_cached(&sql)?;
                     stmt.query_map([values::to_sql(old)], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
                 };
                 if ids.is_empty() {
@@ -1130,6 +1153,7 @@ impl Drop for Txn<'_> {
     fn drop(&mut self) {
         if !self.done {
             let _ = self.store.conn.execute_batch("ROLLBACK");
+            self.store.hash_cache = None;
         }
     }
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/synod-core", "crates/synod-sim", "crates/synod-store", "crates/synod-cli"]
+members = ["crates/synod-core", "crates/synod-sim", "crates/synod-store", "crates/synod-node", "crates/synod-net", "crates/synod-cli"]
 
 [workspace.package]
 version = "0.0.1"
@@ -12,6 +12,9 @@ repository = "https://github.com/Jeanlr10/SynodSQL"
 [workspace.dependencies]
 synod-core = { path = "crates/synod-core" }
 synod-sim = { path = "crates/synod-sim" }
+synod-store = { path = "crates/synod-store" }
+synod-node = { path = "crates/synod-node" }
+synod-net = { path = "crates/synod-net" }
 blake3 = "1.8"
 proptest = "1.12"
 rusqlite = { version = "0.40", features = ["bundled"] }

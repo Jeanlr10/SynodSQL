@@ -72,8 +72,9 @@ impl Cluster {
     }
 }
 
-fn manifest(epoch: u64, logs: Vec<LogRef>, lateness: u64) -> Manifest {
-    Manifest::new(epoch, 0, NodeId(1), epoch.checked_sub(lateness), logs)
+/// A manifest that follows the last merge of `s`.
+fn manifest(s: &Store, epoch: u64, logs: Vec<LogRef>, lateness: u64) -> Manifest {
+    Manifest::new(epoch, 0, NodeId(1), s.head().unwrap(), epoch.checked_sub(lateness), logs)
 }
 
 fn insert(s: &mut Store, sku: &str, qty: i64) -> RowId {
@@ -109,7 +110,10 @@ fn gc_removes_tombstones_and_resolved_conflicts_after_l_epochs() {
     let gone = insert(&mut c.stores[0], "A-1", 5);
     let kept = insert(&mut c.stores[0], "A-2", 5);
     let refs = c.seal(0, &all, &all);
-    c.merge(&manifest(0, refs, L), &all);
+    {
+        let m = manifest(&c.stores[0], 0, refs, L);
+        c.merge(&m, &all)
+    };
 
     // Epoch 1: one row deleted, one price conflict (lww_flag).
     c.at(1, 100);
@@ -117,9 +121,10 @@ fn gc_removes_tombstones_and_resolved_conflicts_after_l_epochs() {
     update(&mut c.stores[0], kept, "price", dec("1.00"));
     update(&mut c.stores[2], kept, "price", dec("2.00"));
     let refs = c.seal(1, &all, &all);
-    let report = c.stores[0].merge_manifest(&manifest(1, refs.clone(), L)).unwrap();
+    let m1 = manifest(&c.stores[0], 1, refs, L);
+    let report = c.stores[0].merge_manifest(&m1).unwrap();
     assert_eq!(report.conflicts.len(), 1);
-    c.merge(&manifest(1, refs, L), &[1, 2]);
+    c.merge(&m1, &[1, 2]);
     let (conflict, _, status) = c.stores[0].conflicts().unwrap().remove(0);
     assert_eq!(status, "open");
     assert!(c.stores[0].row("inventory", gone).unwrap().unwrap().is_tombstone());
@@ -133,7 +138,7 @@ fn gc_removes_tombstones_and_resolved_conflicts_after_l_epochs() {
     let mut reference = MemState::new(c.stores[0].tables().to_vec()).unwrap();
     for epoch in 2..=5u64 {
         let refs = c.seal(epoch, &all, &all);
-        let m = manifest(epoch, refs, L);
+        let m = manifest(&c.stores[0], epoch, refs, L);
         let root = c.merge(&m, &all);
         let has = |id: RowId| row_ids(&c.stores[0]).contains(&id);
         // The tombstone and the conflict are from epoch 1: they go when
@@ -157,9 +162,19 @@ fn gc_removes_tombstones_and_resolved_conflicts_after_l_epochs() {
     // History beyond L is gone; the last L + 1 merges are kept.
     let merged: Vec<u64> = c.stores[0].merged_records().unwrap().iter().map(|r| r.epoch).collect();
     assert_eq!(merged, vec![3, 4, 5]);
-    assert!(c.stores[0].known_logs(0).unwrap().iter().all(|(r, _)| r.epoch >= 3));
-    assert!(c.stores[0].sealed(1).unwrap().is_none());
-    assert!(c.stores[0].sealed(5).unwrap().is_some());
+    // Logs of other nodes go after L epochs; own logs stay for 4 L.
+    let me = c.stores[0].config().node;
+    let logs = c.stores[0].known_logs(0).unwrap();
+    assert!(logs.iter().all(|(r, _)| r.epoch >= 3 || r.node == me));
+    assert!(logs.iter().any(|(r, _)| r.epoch == 0 && r.node == me));
+    assert!(c.stores[0].sealed(0).unwrap().is_some());
+    for epoch in 6..=4 * L + 1 {
+        let refs = c.seal(epoch, &all, &all);
+        let m = manifest(&c.stores[0], epoch, refs, L);
+        c.merge(&m, &all);
+    }
+    assert!(c.stores[0].sealed(0).unwrap().is_none());
+    assert!(c.stores[0].sealed(1).unwrap().is_some());
 }
 
 #[test]
@@ -199,7 +214,10 @@ fn unmerge_goes_back_and_a_better_manifest_merges() {
         c.at(0, 100);
         let ids: Vec<RowId> = (0..4).map(|i| insert(&mut c.stores[i % 3], &format!("S-{i}"), 10)).collect();
         let refs = c.seal(0, &all, &all);
-        c.merge(&manifest(0, refs, 4), &all);
+        {
+            let m = manifest(&c.stores[0], 0, refs, 4);
+            c.merge(&m, &all)
+        };
 
         c.at(1, 100);
         for s in c.stores.iter_mut() {
@@ -211,8 +229,9 @@ fn unmerge_goes_back_and_a_better_manifest_merges() {
         let refs = c.seal(1, &all, &all);
         // Node 0 merges a manifest without node 2's log (rank 1), then the
         // rank 0 manifest with all logs appears.
-        let partial = Manifest::new(1, 1, NodeId(2), None, refs[..2].to_vec());
-        let full = Manifest::new(1, 0, NodeId(1), None, refs.clone());
+        let parent = c.stores[0].head().unwrap();
+        let partial = Manifest::new(1, 1, NodeId(2), parent, None, refs[..2].to_vec());
+        let full = Manifest::new(1, 0, NodeId(1), parent, None, refs.clone());
         let before = c.stores[0].base_root().unwrap();
         c.at(1, EPOCH_MS + 200);
         let inflight = insert(&mut c.stores[0], "late", 1);
@@ -234,12 +253,18 @@ fn unmerge_of_the_first_merge() {
     insert(&mut c.stores[0], "A", 1);
     let refs = c.seal(0, &[0, 1], &[0, 1]);
     let empty = c.stores[0].base_root().unwrap();
-    c.merge(&manifest(0, refs.clone(), 4), &[0]);
+    {
+        let m = manifest(&c.stores[0], 0, refs.clone(), 4);
+        c.merge(&m, &[0])
+    };
     assert_eq!(c.stores[0].unmerge().unwrap(), 0);
     assert_eq!(c.stores[0].merged_epoch().unwrap(), None);
     assert_eq!(c.stores[0].base_root().unwrap(), empty);
     assert!(matches!(c.stores[0].unmerge(), Err(Error::Invalid(_))));
-    c.merge(&manifest(0, refs, 4), &[0, 1]);
+    {
+        let m = manifest(&c.stores[0], 0, refs, 4);
+        c.merge(&m, &[0, 1])
+    };
 }
 
 /// Takes over `from`'s base state by a Prolly diff, as a returning node
@@ -285,7 +310,10 @@ fn a_returning_node_catches_up_by_diff_and_its_writes_merge_late() {
     c.at(0, 100);
     let ids: Vec<RowId> = (0..6).map(|i| insert(&mut c.stores[0], &format!("S-{i}"), 10)).collect();
     let refs = c.seal(0, &all, &all);
-    c.merge(&manifest(0, refs, L), &all);
+    {
+        let m = manifest(&c.stores[0], 0, refs, L);
+        c.merge(&m, &all)
+    };
 
     // Node 2 is cut off from epoch 1 on. It writes in epoch 1 (on a row
     // that is deleted in epoch 1 elsewhere) and in epoch 6.
@@ -297,7 +325,10 @@ fn a_returning_node_catches_up_by_diff_and_its_writes_merge_late() {
         c.at(epoch, 200);
         update(&mut c.stores[1], ids[2], "qty", Value::Integer(epoch as i64));
         let refs = c.seal(epoch, &up, &up);
-        c.merge(&manifest(epoch, refs, L), &up);
+        {
+            let m = manifest(&c.stores[0], epoch, refs, L);
+            c.merge(&m, &up)
+        };
     }
     c.at(6, 300);
     let fresh = insert(&mut c.stores[2], "C-new", 1);
@@ -328,7 +359,10 @@ fn a_returning_node_catches_up_by_diff_and_its_writes_merge_late() {
     let late: Vec<LogRef> = own.iter().filter(|r| r.epoch + L >= 7).copied().collect();
     let mut refs = c.seal(7, &all, &all);
     refs.extend(late);
-    let root = c.merge(&manifest(7, refs.clone(), L), &all);
+    let root = {
+        let m = manifest(&c.stores[0], 7, refs.clone(), L);
+        c.merge(&m, &all)
+    };
     // The give-up conflicts are local writes of epoch 6 or 7 on node 2:
     // after the merge of epoch 7 every node has them.
     let kinds: Vec<String> =
@@ -349,7 +383,10 @@ fn a_late_write_to_a_collected_row_is_a_stale_write() {
     c.at(0, 100);
     let id = insert(&mut c.stores[0], "X", 1);
     let refs = c.seal(0, &all, &all);
-    c.merge(&manifest(0, refs, L), &all);
+    {
+        let m = manifest(&c.stores[0], 0, refs, L);
+        c.merge(&m, &all)
+    };
 
     // Node 0 deletes the row in epoch 1. Node 2 is cut off and updates it
     // in epoch 3, on its old base.
@@ -359,7 +396,10 @@ fn a_late_write_to_a_collected_row_is_a_stale_write() {
     update(&mut c.stores[2], id, "qty", Value::Integer(2));
     for epoch in 1..=4 {
         let refs = c.seal(epoch, &up, &up);
-        c.merge(&manifest(epoch, refs, L), &up);
+        {
+            let m = manifest(&c.stores[0], epoch, refs, L);
+            c.merge(&m, &up)
+        };
     }
     assert!(!row_ids(&c.stores[0]).contains(&id), "collected at gc_through 1");
 
@@ -379,8 +419,9 @@ fn a_late_write_to_a_collected_row_is_a_stale_write() {
             refs.push(*r);
         }
     }
-    let report = c.stores[0].merge_manifest(&manifest(5, refs.clone(), L)).unwrap();
-    c.merge(&manifest(5, refs, L), &[1, 2]);
+    let m5 = manifest(&c.stores[0], 5, refs, L);
+    let report = c.stores[0].merge_manifest(&m5).unwrap();
+    c.merge(&m5, &[1, 2]);
     assert_eq!(report.conflicts.len(), 1);
     assert_eq!(report.conflicts[0].kind.as_str(), "stale_write");
     assert_eq!(c.stores[2].base_root().unwrap(), report.root);
@@ -395,14 +436,21 @@ fn logs_older_than_the_lateness_bound_are_refused() {
     let late = c.seal(0, &[1], &[0]);
     for epoch in 0..=1 {
         let refs = c.seal(epoch, &[0], &[0]);
-        c.merge(&manifest(epoch, refs, 1), &[0]);
+        {
+            let m = manifest(&c.stores[0], epoch, refs, 1);
+            c.merge(&m, &[0])
+        };
     }
     let refs = c.seal(2, &[0], &[0]);
     let mut logs = refs.clone();
     logs.extend(late);
-    let err = c.stores[0].merge_manifest(&manifest(2, logs, 1)).unwrap_err();
+    let m = manifest(&c.stores[0], 2, logs, 1);
+    let err = c.stores[0].merge_manifest(&m).unwrap_err();
     assert!(err.to_string().contains("lateness"), "{err}");
-    c.merge(&manifest(2, refs, 1), &[0]);
+    {
+        let m = manifest(&c.stores[0], 2, refs, 1);
+        c.merge(&m, &[0])
+    };
 }
 
 #[test]
@@ -413,7 +461,10 @@ fn revert_undoes_a_nodes_writes() {
     let a = insert(&mut c.stores[0], "A", 10);
     let b = insert(&mut c.stores[0], "B", 10);
     let refs = c.seal(0, &all, &all);
-    c.merge(&manifest(0, refs, 8), &all);
+    {
+        let m = manifest(&c.stores[0], 0, refs, 8);
+        c.merge(&m, &all)
+    };
 
     // Node 2 (index 1) makes bad writes in epoch 1.
     c.at(1, 100);
@@ -422,12 +473,18 @@ fn revert_undoes_a_nodes_writes() {
     update(&mut c.stores[1], b, "name", text("wrong too"));
     delete(&mut c.stores[1], b);
     let refs = c.seal(1, &all, &all);
-    c.merge(&manifest(1, refs, 8), &all);
+    {
+        let m = manifest(&c.stores[0], 1, refs, 8);
+        c.merge(&m, &all)
+    };
     // Node 1 changes `a` again later: that change stays.
     c.at(2, 100);
     update(&mut c.stores[0], a, "name", text("fixed by hand"));
     let refs = c.seal(2, &all, &all);
-    c.merge(&manifest(2, refs, 8), &all);
+    {
+        let m = manifest(&c.stores[0], 2, refs, 8);
+        c.merge(&m, &all)
+    };
 
     c.at(3, 100);
     let mut t = c.stores[0].begin().unwrap();
@@ -441,6 +498,9 @@ fn revert_undoes_a_nodes_writes() {
     assert_eq!(back, vec![vec![rusqlite::types::Value::Null]], "B comes back as a new row, as it was");
     // The revert travels as normal writes.
     let refs = c.seal(3, &all, &all);
-    c.merge(&manifest(3, refs, 8), &all);
+    {
+        let m = manifest(&c.stores[0], 3, refs, 8);
+        c.merge(&m, &all)
+    };
     assert_eq!(c.stores[1].query("SELECT name FROM inventory WHERE sku = 'B'", &[]).unwrap().len(), 1);
 }

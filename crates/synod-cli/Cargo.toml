@@ -13,7 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 synod-core.workspace = true
-synod-store = { path = "../synod-store" }
+synod-store.workspace = true
+synod-node.workspace = true
+synod-net.workspace = true
 rusqlite.workspace = true
 
 [lints]

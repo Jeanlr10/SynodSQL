@@ -1,10 +1,10 @@
 //! Logs, merges, unmerges, catch-up, and the local rebase (white paper,
 //! Sections V and XI; specification Sections 6 and 7).
 //!
-//! Every change of the base state runs in [`Store::rebuild`]: on a copy of
-//! the store file, in one transaction, it restores and checks M(e−1),
-//! changes the base, checks the new base root, indexes the new base for
-//! diffs, rebases the local writes, and switches files atomically.
+//! Every change of the base state runs in [`Store::rebuild`], in one SQLite
+//! transaction: it restores and checks M(e−1), changes the base, checks
+//! the new base root, indexes the new base for diffs, and rebases the local
+//! writes. The commit is the atomic switch.
 
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
@@ -17,8 +17,8 @@ use synod_core::{LogEntry, NodeId, Row, RowHash, RowId, Stamp, Value};
 
 use crate::error::{Error, Result};
 use crate::merge::{
-    BaseState, Conflict, ConflictKind, LogInput, MERGE_NODE, MergeInput, Recorded, conflict_id, encode_recorded,
-    failed_checks, merge, validate_log,
+    BaseState, Conflict, ConflictKind, LogInput, MERGE_NODE, MergeInput, Recorded, encode_recorded, failed_checks,
+    given_up_id, merge, validate_log,
 };
 use crate::schema::{TableSchema, schema_hash};
 use crate::store::{Store, StoreConfig, Txn, hlc_at, mark_dirty, parse_row_id, read_row, record_undo, write_row};
@@ -52,10 +52,15 @@ pub struct MergedRecord {
     pub epoch: u64,
     /// The manifest.
     pub manifest: Manifest,
+    /// The manifest's hash.
+    pub hash: [u8; 32],
     /// Root hash before the merge, M(e−1).
     pub base_before: NodeHash,
     /// Root hash after the merge, M(e).
     pub root: NodeHash,
+    /// True if this node made the merge and keeps what it needs to undo
+    /// it; false for a merge taken over from a peer.
+    pub undoable: bool,
 }
 
 /// A log that a merge took.
@@ -130,7 +135,7 @@ impl BaseState for BaseView<'_> {
             if t.id == 0 {
                 sql.push_str(" OR (\"_tomb\" = 0 AND \"status\" = 'resolved' AND \"epoch\" <= ?2)");
             }
-            let mut stmt = self.conn.prepare(&sql)?;
+            let mut stmt = self.conn.prepare_cached(&sql)?;
             let args: &[&dyn rusqlite::ToSql] =
                 if t.id == 0 { &[&(epoch as i64 + 1), &(epoch as i64)] } else { &[&(epoch as i64 + 1)] };
             let ids: Vec<Vec<u8>> = stmt.query_map(args, |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
@@ -160,6 +165,14 @@ impl Store {
     /// nothing.
     pub fn add_log(&mut self, bytes: &[u8]) -> Result<LogRef> {
         let hash = log_hash(bytes);
+        let known: Option<(u32, i64)> = self
+            .conn
+            .prepare_cached("SELECT node, epoch FROM _synod_logs WHERE log_hash = ?1")?
+            .query_row([hash.to_vec()], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        if let Some((node, epoch)) = known {
+            return Ok(LogRef { node: NodeId(node), epoch: epoch as u64, hash });
+        }
         let (h, entries) = decode_log(bytes).map_err(|e| Error::Invalid(format!("log: {e}")))?;
         let who = format!("log of node {} for epoch {}", h.node, h.epoch);
         if h.schema_hash != schema_hash(self.tables.iter().map(|t| &**t)) {
@@ -172,11 +185,48 @@ impl Store {
             return Err(Error::Invalid(format!("{who} has this node's ID but is not its log")));
         }
         validate_log(&self.tables, &LogInput { node: h.node, epoch: h.epoch, entries })?;
-        self.conn.execute(
-            "INSERT OR IGNORE INTO _synod_logs (log_hash, node, epoch, log) VALUES (?1, ?2, ?3, ?4)",
-            params![hash.to_vec(), h.node.0, h.epoch as i64, bytes],
-        )?;
+        self.conn
+            .prepare_cached("INSERT OR IGNORE INTO _synod_logs (log_hash, node, epoch, log) VALUES (?1, ?2, ?3, ?4)")?
+            .execute(params![hash.to_vec(), h.node.0, h.epoch as i64, bytes])?;
         Ok(LogRef { node: h.node, epoch: h.epoch, hash })
+    }
+
+    /// Returns this node's own logs of epochs `from` and later that are
+    /// not given up, by epoch, with true if a merge took the log.
+    pub fn own_logs(&self, from: u64) -> Result<Vec<(LogRef, bool)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT l.epoch, l.log_hash, m.log_hash IS NOT NULL FROM _synod_logs l
+             LEFT JOIN _synod_merged_log m ON m.log_hash = l.log_hash
+             WHERE l.node = ?1 AND l.epoch >= ?2 AND l.abandoned = 0 ORDER BY l.epoch",
+        )?;
+        let me = self.config.node;
+        let rows = stmt.query_map(params![me.0, from as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, bool>(2)?))
+        })?;
+        rows.map(|r| {
+            let (epoch, hash, merged) = r?;
+            Ok((LogRef { node: me, epoch: epoch as u64, hash: hash32(hash, "log hash")? }, merged))
+        })
+        .collect()
+    }
+
+    /// Returns the number of nodes whose log of `epoch` this node keeps.
+    pub fn log_nodes(&self, epoch: u64) -> Result<usize> {
+        let n: i64 = self
+            .conn
+            .prepare_cached("SELECT count(DISTINCT node) FROM _synod_logs WHERE epoch = ?1 AND abandoned = 0")?
+            .query_row([epoch as i64], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// True if this node keeps the log with this hash.
+    pub fn has_log(&self, hash: &[u8; 32]) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT 1 FROM _synod_logs WHERE log_hash = ?1")?
+            .query_row([hash.to_vec()], |_| Ok(()))
+            .optional()?
+            .is_some())
     }
 
     /// Returns a log that this node keeps.
@@ -190,7 +240,7 @@ impl Store {
     /// Returns the logs that this node keeps, of epochs `from` and later,
     /// sorted by (node, epoch), with true if a merge took the log.
     pub fn known_logs(&self, from: u64) -> Result<Vec<(LogRef, bool)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT l.node, l.epoch, l.log_hash, m.log_hash IS NOT NULL FROM _synod_logs l
              LEFT JOIN _synod_merged_log m ON m.log_hash = l.log_hash
              WHERE l.epoch >= ?1 AND l.abandoned = 0 ORDER BY l.node, l.epoch",
@@ -218,8 +268,27 @@ impl Store {
 
     /// Returns the last merged epoch, if any.
     pub fn merged_epoch(&self) -> Result<Option<u64>> {
-        let e: Option<i64> = self.conn.query_row("SELECT merged_epoch FROM _synod_node", [], |r| r.get(0))?;
+        let e: Option<i64> =
+            self.conn.prepare_cached("SELECT merged_epoch FROM _synod_node")?.query_row([], |r| r.get(0))?;
         Ok(e.map(|e| e as u64))
+    }
+
+    /// Returns the hash of the last merge's manifest, the parent of the
+    /// next manifest: all zeros before the first merge.
+    pub fn head(&self) -> Result<[u8; 32]> {
+        let h: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT m.manifest_hash FROM _synod_node n JOIN _synod_merged m ON m.epoch = n.merged_epoch",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match h {
+            Some(h) => hash32(h, "manifest hash"),
+            None if self.merged_epoch()?.is_none() => Ok([0; 32]),
+            None => Err(Error::Corrupt("the last merge has no record".into())),
+        }
     }
 
     /// Returns the epoch that the next merge must merge.
@@ -237,18 +306,28 @@ impl Store {
 
     /// Returns this node's merge history (the last L epochs), by epoch.
     pub fn merged_records(&self) -> Result<Vec<MergedRecord>> {
-        let mut stmt =
-            self.conn.prepare("SELECT epoch, manifest, base_before, root FROM _synod_merged ORDER BY epoch")?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT epoch, manifest, base_before, root, undoable, manifest_hash FROM _synod_merged ORDER BY epoch",
+        )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?, r.get::<_, Vec<u8>>(3)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+                r.get::<_, bool>(4)?,
+                r.get::<_, Vec<u8>>(5)?,
+            ))
         })?;
         rows.map(|r| {
-            let (epoch, m, before, root) = r?;
+            let (epoch, m, before, root, undoable, hash) = r?;
             Ok(MergedRecord {
                 epoch: epoch as u64,
                 manifest: Manifest::decode(&m).map_err(|e| Error::Corrupt(format!("manifest: {e}")))?,
+                hash: hash32(hash, "manifest hash")?,
                 base_before: hash32(before, "base root")?,
                 root: hash32(root, "root")?,
+                undoable,
             })
         })
         .collect()
@@ -286,11 +365,13 @@ impl Store {
             refs.push(self.add_log(bytes)?);
         }
         // The same manifest on every node: no leader, no garbage collection.
-        self.merge_manifest(&Manifest::new(epoch, 0, MERGE_NODE, None, refs))
+        let parent = self.head()?;
+        self.merge_manifest(&Manifest::new(epoch, 0, MERGE_NODE, parent, None, refs))
     }
 
-    /// Merges the next epoch with a manifest. Every log of the manifest
-    /// must be kept by this node ([`add_log`](Store::add_log)).
+    /// Merges the next epoch with a manifest. Its parent must be this
+    /// node's [`head`](Store::head), and every log of the manifest must be
+    /// kept by this node ([`add_log`](Store::add_log)).
     ///
     /// If the merge fails before the switch, the store is unchanged. If the
     /// switch itself fails, reopen the store.
@@ -299,6 +380,9 @@ impl Store {
         let expected = self.next_merge_epoch()?;
         if epoch != expected {
             return Err(Error::Invalid(format!("the next epoch to merge is {expected}, not {epoch}")));
+        }
+        if m.parent != self.head()? {
+            return Err(Error::Invalid(format!("{m} does not follow this node's last merge")));
         }
         let lateness = self.config.lateness;
         let mut logs = Vec::new();
@@ -335,28 +419,16 @@ impl Store {
             // Keep M(e−1) of every changed row, to unmerge.
             for (id, t) in out.rows.iter().map(|(id, (t, _))| (id, t)).chain(out.removed.iter()) {
                 let before = read_row(&s.conn, &tables[*t as usize], *id)?;
-                s.conn.execute(
-                    "INSERT OR REPLACE INTO _synod_merge_undo (epoch, row_id, tbl, row) VALUES (?1, ?2, ?3, ?4)",
-                    params![epoch as i64, id.to_be_bytes().to_vec(), t, before.map(|r| r.to_canonical_bytes())],
+                s.conn.prepare_cached("INSERT OR REPLACE INTO _synod_merge_undo (epoch, row_id, tbl, row) VALUES (?1, ?2, ?3, ?4)")?.execute(params![epoch as i64, id.to_be_bytes().to_vec(), t, before.map(|r| r.to_canonical_bytes())],
                 )?;
             }
-            for (id, (t, row)) in &out.rows {
-                write_row(&s.conn, &tables[*t as usize], row)?;
-                mark_dirty(&s.conn, *t, *id)?;
-            }
-            for (id, t) in &out.removed {
-                delete_row(&s.conn, &tables[*t as usize], *id)?;
-                mark_dirty(&s.conn, *t, *id)?;
-            }
+            let puts = out.rows.iter().map(|(id, (t, row))| (*t, *id, Some(row.clone())));
+            s.put_rows(puts.chain(out.removed.iter().map(|(id, t)| (*t, *id, None))).collect())?;
             let root = s.refresh_state_hash()?;
-            s.conn.execute(
-                "UPDATE _synod_node SET merged_epoch = ?1, base_root = ?2",
-                params![epoch as i64, root.to_vec()],
+            s.conn.prepare_cached("UPDATE _synod_node SET merged_epoch = ?1, base_root = ?2")?.execute(params![epoch as i64, root.to_vec()],
             )?;
-            s.conn.execute(
-                "INSERT INTO _synod_merged (epoch, manifest, manifest_hash, rank, base_before, root, conflicts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
+            s.conn.prepare_cached("INSERT INTO _synod_merged (epoch, manifest, manifest_hash, rank, base_before, root, conflicts, undoable)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)")?.execute(params![
                     epoch as i64,
                     manifest.encode(),
                     manifest_hash.to_vec(),
@@ -367,9 +439,7 @@ impl Store {
                 ],
             )?;
             for r in &manifest.logs {
-                s.conn.execute(
-                    "INSERT INTO _synod_merged_log (log_hash, merged_in, node, log_epoch) VALUES (?1, ?2, ?3, ?4)",
-                    params![r.hash.to_vec(), epoch as i64, r.node.0, r.epoch as i64],
+                s.conn.prepare_cached("INSERT INTO _synod_merged_log (log_hash, merged_in, node, log_epoch) VALUES (?1, ?2, ?3, ?4)")?.execute(params![r.hash.to_vec(), epoch as i64, r.node.0, r.epoch as i64],
                 )?;
             }
             s.gc_local(epoch)?;
@@ -395,10 +465,10 @@ impl Store {
     /// the unmerged epoch.
     pub fn unmerge(&mut self) -> Result<u64> {
         let epoch = self.merged_epoch()?.ok_or_else(|| Error::Invalid("no merge to undo".into()))?;
-        // The merge record and its undo records are kept together, so a
-        // kept record can be undone.
-        let Some(record) = self.merged_record(epoch)? else {
-            return Err(Error::Invalid(format!("the merge of epoch {epoch} is not kept and cannot be undone")));
+        // A merge that this node made keeps its undo records as long as its
+        // record; a merge taken over from a peer has none.
+        let Some(record) = self.merged_record(epoch)?.filter(|r| r.undoable) else {
+            return Err(Error::Invalid(format!("the merge of epoch {epoch} cannot be undone")));
         };
         self.rebuild(move |s| {
             let undo: Vec<(Vec<u8>, u32, Option<Vec<u8>>)> = {
@@ -408,19 +478,14 @@ impl Store {
                 stmt.query_map([epoch as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                     .collect::<rusqlite::Result<_>>()?
             };
-            for (id, tbl, row) in undo {
-                let schema = s.tables[tbl as usize].clone();
-                let row_id = parse_row_id(&id)?;
-                match row {
-                    None => delete_row(&s.conn, &schema, row_id)?,
-                    Some(b) => write_row(
-                        &s.conn,
-                        &schema,
-                        &Row::from_canonical_bytes(&b).map_err(|e| Error::Corrupt(format!("undo: {e}")))?,
-                    )?,
-                }
-                mark_dirty(&s.conn, tbl, row_id)?;
-            }
+            let puts = undo
+                .into_iter()
+                .map(|(id, tbl, row)| {
+                    let row = row.map(|b| Row::from_canonical_bytes(&b)).transpose();
+                    Ok((tbl, parse_row_id(&id)?, row.map_err(|e| Error::Corrupt(format!("undo: {e}")))?))
+                })
+                .collect::<Result<_>>()?;
+            s.put_rows(puts)?;
             s.conn.execute_batch(&format!(
                 "DELETE FROM _synod_merge_undo WHERE epoch = {epoch};
                  DELETE FROM _synod_merged WHERE epoch = {epoch};
@@ -428,11 +493,12 @@ impl Store {
             ))?;
             // Merges are consecutive from the first epoch: the merged epoch
             // goes back by one, or to none.
-            s.conn.execute(
-                "UPDATE _synod_node SET base_root = ?1,
+            s.conn
+                .prepare_cached(
+                    "UPDATE _synod_node SET base_root = ?1,
                    merged_epoch = CASE WHEN ?2 > first_epoch THEN ?2 - 1 ELSE NULL END",
-                params![record.base_before.to_vec(), epoch as i64],
-            )?;
+                )?
+                .execute(params![record.base_before.to_vec(), epoch as i64])?;
             Ok(epoch)
         })
         .map(|(e, _)| e)
@@ -449,39 +515,55 @@ impl Store {
         let rows = rows.to_vec();
         let removed = removed.to_vec();
         self.rebuild(move |s| {
-            for (t, row) in &rows {
-                let schema = s.tables.get(*t as usize).ok_or_else(|| Error::Invalid(format!("table {t}")))?.clone();
-                write_row(&s.conn, &schema, row)?;
-                mark_dirty(&s.conn, *t, row.row_id)?;
+            let mut puts = Vec::new();
+            for (t, row) in rows {
+                if t as usize >= s.tables.len() {
+                    return Err(Error::Invalid(format!("table {t}")));
+                }
+                puts.push((t, row.row_id, Some(row)));
             }
             for id in &removed {
                 if let Some(t) = s.base_table_of(*id)? {
-                    let schema = s.tables[t as usize].clone();
-                    delete_row(&s.conn, &schema, *id)?;
-                    mark_dirty(&s.conn, t, *id)?;
+                    puts.push((t, *id, None));
                 }
             }
+            s.put_rows(puts)?;
             s.conn.execute_batch("DELETE FROM _synod_merged; DELETE FROM _synod_merged_log; DELETE FROM _synod_merge_undo;")?;
             for r in &image.merged {
-                s.conn.execute(
-                    "INSERT INTO _synod_merged (epoch, manifest, manifest_hash, rank, base_before, root, conflicts)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-                    params![r.epoch as i64, r.manifest.encode(), r.manifest.hash().to_vec(), r.manifest.rank, r.base_before.to_vec(), r.root.to_vec()],
+                s.conn.prepare_cached("INSERT INTO _synod_merged (epoch, manifest, manifest_hash, rank, base_before, root, conflicts, undoable)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0)")?.execute(params![r.epoch as i64, r.manifest.encode(), r.hash.to_vec(), r.manifest.rank, r.base_before.to_vec(), r.root.to_vec()],
                 )?;
             }
             for l in &image.merged_logs {
-                s.conn.execute(
-                    "INSERT OR REPLACE INTO _synod_merged_log (log_hash, merged_in, node, log_epoch) VALUES (?1, ?2, ?3, ?4)",
-                    params![l.hash.to_vec(), l.merged_in as i64, l.node.0, l.log_epoch as i64],
+                s.conn.prepare_cached("INSERT OR REPLACE INTO _synod_merged_log (log_hash, merged_in, node, log_epoch) VALUES (?1, ?2, ?3, ?4)")?.execute(params![l.hash.to_vec(), l.merged_in as i64, l.node.0, l.log_epoch as i64],
                 )?;
             }
+            // The open epoch stays: this node's unsealed writes are sealed in
+            // their own epochs, then merged late or given up.
             match image.epoch {
-                Some(e) => s.conn.execute(
-                    "UPDATE _synod_node SET merged_epoch = ?1, base_root = ?2, open_epoch = max(open_epoch, ?3)",
-                    params![e as i64, image.root.to_vec(), e as i64 + 1],
+                Some(e) => s.conn.prepare_cached("UPDATE _synod_node SET merged_epoch = ?1, base_root = ?2")?.execute(params![e as i64, image.root.to_vec()],
                 )?,
-                None => s.conn.execute("UPDATE _synod_node SET merged_epoch = NULL, base_root = ?1", [image.root.to_vec()])?,
+                None => s.conn.prepare_cached("UPDATE _synod_node SET merged_epoch = NULL, base_root = ?1")?.execute([image.root.to_vec()])?,
             };
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    /// Test hook: changes one column of a row in the base state, and makes
+    /// the result the base state, as a faulty merge would. The node then
+    /// differs from its peers on the next merge, and the verify step must
+    /// find and repair it.
+    #[cfg(feature = "test-hooks")]
+    pub fn diverge_for_tests(&mut self, table: &str, row_id: RowId, column: usize, value: Value) -> Result<()> {
+        let schema = self.table(table)?;
+        self.rebuild(move |s| {
+            let mut row = read_row(&s.conn, &schema, row_id)?.ok_or_else(|| Error::Invalid("no such row".into()))?;
+            row.cells[column].value = value;
+            write_row(&s.conn, &schema, &row)?;
+            mark_dirty(&s.conn, schema.id, row_id)?;
+            let root = s.refresh_state_hash()?;
+            s.conn.prepare_cached("UPDATE _synod_node SET base_root = ?1")?.execute([root.to_vec()])?;
             Ok(())
         })
         .map(|_| ())
@@ -551,11 +633,10 @@ impl Store {
 
     fn base_table_of(&self, id: RowId) -> Result<Option<u32>> {
         for t in &self.tables {
-            let found: bool = self.conn.query_row(
-                &format!("SELECT count(*) > 0 FROM \"{}\" WHERE \"_row_id\" = ?1", t.physical()),
-                [id.to_be_bytes().to_vec()],
-                |r| r.get(0),
-            )?;
+            let found: bool = self
+                .conn
+                .prepare_cached(&format!("SELECT count(*) > 0 FROM \"{}\" WHERE \"_row_id\" = ?1", t.physical()))?
+                .query_row([id.to_be_bytes().to_vec()], |r| r.get(0))?;
             if found {
                 return Ok(Some(t.id));
             }
@@ -576,6 +657,12 @@ impl Store {
             return Err(Error::Invalid(format!("the log of epoch {epoch} was merged")));
         }
         let (_, entries) = decode_log(&own.bytes).map_err(|e| Error::Corrupt(format!("own log: {e}")))?;
+        if entries.is_empty() {
+            self.conn
+                .prepare_cached("UPDATE _synod_logs SET abandoned = 1 WHERE log_hash = ?1")?
+                .execute([own.hash.to_vec()])?;
+            return Ok(0);
+        }
         let mut by_row: BTreeMap<RowId, (u32, Vec<Recorded>)> = BTreeMap::new();
         for e in &entries {
             let values = e.after.clone().or_else(|| e.before.clone()).unwrap_or_default();
@@ -586,10 +673,11 @@ impl Store {
             });
         }
         let tables = self.tables.clone();
+        let me = self.config.node;
         let mut t = self.begin()?;
         for (row_id, (table, recorded)) in by_row {
             let schema = &tables[table as usize];
-            let id = conflict_id(epoch, &schema.name, row_id, None, ConflictKind::StaleWrite);
+            let id = given_up_id(me, epoch, &schema.name, row_id);
             t.insert(
                 "_conflicts",
                 &[
@@ -613,45 +701,26 @@ impl Store {
 
     // ------------------------------------------------------------ rebuild
 
-    /// Changes the base state with `change`, on a copy of the store file,
-    /// and switches to the copy. `change` runs after M(e−1) is restored and
-    /// checked; it must leave the base root in `_synod_node` equal to the
-    /// state it makes. Returns its value and the number of rebased entries.
+    /// Changes the base state with `change`, in one SQLite transaction: the
+    /// new pages go to the WAL beside the old ones, and the commit is the
+    /// atomic switch (white paper, Section XI-B). `change` runs after
+    /// M(e−1) is restored and checked; it must leave the base root in
+    /// `_synod_node` equal to the state it makes. Returns its value and the
+    /// number of rebased entries. On an error nothing changes.
     fn rebuild<T>(&mut self, change: impl FnOnce(&mut Store) -> Result<T>) -> Result<(T, usize)> {
-        let next = format!("{}.next", self.path);
-        if self.env.fs.exists(&next)? {
-            self.env.fs.remove(&next)?;
-        }
-        self.conn.execute("VACUUM INTO ?1", [&next])?;
-        let built = Store::open(&next, self.config.clone(), self.env.clone()).and_then(|mut n| {
-            let out = n.in_txn(|s| {
-                let indexes = s.drop_unique_indexes()?;
-                let base_root = s.base_root()?;
-                s.restore_base(base_root)?;
-                let value = change(s)?;
-                let root = s.refresh_state_hash()?;
-                if root != s.base_root()? {
-                    return Err(Error::Corrupt("the new base state does not have its root hash".into()));
-                }
-                s.index_base(root)?;
-                let rebased = s.rebase_local()?;
-                s.create_indexes(&indexes)?;
-                s.refresh_state_hash()?;
-                Ok((value, rebased))
-            })?;
-            n.conn.close().map_err(|(_, e)| Error::Sql(e))?;
-            Ok(out)
-        });
-        match built {
-            Ok(out) => {
-                self.switch_to(&next)?;
-                Ok(out)
+        self.in_txn(|s| {
+            let base_root = s.base_root()?;
+            s.restore_base(base_root)?;
+            let value = change(s)?;
+            let root = s.refresh_state_hash()?;
+            if root != s.base_root()? {
+                return Err(Error::Corrupt("the new base state does not have its root hash".into()));
             }
-            Err(e) => {
-                let _ = self.env.fs.remove(&next);
-                Err(e)
-            }
-        }
+            s.index_base(root)?;
+            let rebased = s.rebase_local()?;
+            s.refresh_state_hash()?;
+            Ok((value, rebased))
+        })
     }
 
     // Keeps the base state's row hashes and tree nodes, for diffs. Runs when
@@ -673,7 +742,7 @@ impl Store {
         if nodes.is_empty() {
             nodes.push((root, vec![0; 5]));
         }
-        let mut stmt = self.conn.prepare("INSERT OR REPLACE INTO _synod_tree (hash, node) VALUES (?1, ?2)")?;
+        let mut stmt = self.conn.prepare_cached("INSERT OR REPLACE INTO _synod_tree (hash, node) VALUES (?1, ?2)")?;
         for (h, n) in nodes {
             stmt.execute(params![h.to_vec(), n])?;
         }
@@ -687,7 +756,7 @@ impl Store {
     fn rebase_local(&mut self) -> Result<usize> {
         let me = self.config.node;
         let entries: Vec<LogEntry> = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = self.conn.prepare_cached(
                 "SELECT entry FROM _synod_log WHERE epoch NOT IN
                    (SELECT log_epoch FROM _synod_merged_log WHERE node = ?1
                     UNION SELECT epoch FROM _synod_logs WHERE node = ?1 AND abandoned = 1)
@@ -712,61 +781,70 @@ impl Store {
             gc_through: None,
         };
         let local = merge(&BaseView { conn: &self.conn }, &input)?;
-        for (id, (t, row)) in &local.rows {
-            let schema = &tables[*t as usize];
-            let base = read_row(&self.conn, schema, *id)?;
+        for (id, (t, _)) in &local.rows {
+            let base = read_row(&self.conn, &tables[*t as usize], *id)?;
             record_undo(&self.conn, *t, *id, base.as_ref())?;
-            write_row(&self.conn, schema, row)?;
-            mark_dirty(&self.conn, *t, *id)?;
         }
+        self.put_rows(local.rows.into_iter().map(|(id, (t, row))| (t, id, Some(row))).collect())?;
         Ok(n)
     }
 
     // Drops what is older than the lateness bound: log entries and logs,
     // sealed logs, merge records, and undo records.
     fn gc_local(&mut self, epoch: u64) -> Result<()> {
-        let Some(cutoff) = epoch.checked_sub(self.config.lateness + 1) else { return Ok(()) };
         let me = self.config.node.0;
-        self.conn.execute(
-            "DELETE FROM _synod_log WHERE epoch <= ?1 AND epoch IN
-               (SELECT log_epoch FROM _synod_merged_log WHERE node = ?2
-                UNION SELECT epoch FROM _synod_logs WHERE node = ?2 AND abandoned = 1)",
-            params![cutoff as i64, me],
-        )?;
-        // This node's own logs that no merge took stay until they are
-        // given up (abandon_log).
-        self.conn.execute_batch(&format!(
-            "DELETE FROM _synod_logs WHERE epoch <= {cutoff} AND (node != {me} OR abandoned = 1
-               OR log_hash IN (SELECT log_hash FROM _synod_merged_log));
-             DELETE FROM _synod_sealed WHERE epoch <= {cutoff} AND log_hash IN (SELECT log_hash FROM _synod_merged_log);
-             DELETE FROM _synod_merged WHERE epoch <= {cutoff};
-             DELETE FROM _synod_merged_log WHERE merged_in <= {cutoff};
-             DELETE FROM _synod_merge_undo WHERE epoch <= {cutoff};"
-        ))?;
+        if let Some(cutoff) = epoch.checked_sub(self.config.lateness + 1) {
+            self.conn.execute_batch(&format!(
+                "DELETE FROM _synod_logs WHERE epoch <= {cutoff} AND node != {me};
+                 DELETE FROM _synod_merged WHERE epoch <= {cutoff};
+                 DELETE FROM _synod_merge_undo WHERE epoch <= {cutoff};"
+            ))?;
+        }
+        // Own logs, and which logs were merged, stay longer: if this node
+        // later takes over a peer's chain that did not merge an own log,
+        // the log goes into a later manifest, or to `_conflicts`.
+        if let Some(cutoff) = epoch.checked_sub(self.retention() + 1) {
+            self.conn
+                .prepare_cached(
+                    "DELETE FROM _synod_log WHERE epoch <= ?1 AND epoch IN
+                   (SELECT log_epoch FROM _synod_merged_log WHERE node = ?2
+                    UNION SELECT epoch FROM _synod_logs WHERE node = ?2 AND abandoned = 1)",
+                )?
+                .execute(params![cutoff as i64, me])?;
+            // An own log that no merge took stays until it is given up.
+            self.conn.execute_batch(&format!(
+                "DELETE FROM _synod_logs WHERE epoch <= {cutoff} AND (abandoned = 1
+                   OR log_hash IN (SELECT log_hash FROM _synod_merged_log));
+                 DELETE FROM _synod_sealed WHERE epoch <= {cutoff} AND log_hash IN
+                   (SELECT log_hash FROM _synod_merged_log UNION SELECT log_hash FROM _synod_logs WHERE abandoned = 1);
+                 DELETE FROM _synod_merged_log WHERE merged_in <= {cutoff};"
+            ))?;
+        }
         Ok(())
     }
 
-    // Drops the unique indexes and returns them. Rows are then written one
-    // by one, and a key can move between rows; the indexes come back at the
-    // end with `create_indexes`.
-    fn drop_unique_indexes(&mut self) -> Result<Vec<(String, String)>> {
-        let indexes: Vec<(String, String)> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT name, sql FROM sqlite_schema WHERE type = 'index' AND name LIKE '\\_synod\\_u\\_%' ESCAPE '\\' ORDER BY name",
-            )?;
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
-        };
-        for (name, _) in &indexes {
-            self.conn.execute(&format!("DROP INDEX \"{name}\""), [])?;
-        }
-        Ok(indexes)
+    /// Number of epochs that this node keeps its own logs and the record of
+    /// merged logs: 4 L.
+    pub fn retention(&self) -> u64 {
+        4 * self.config.lateness
     }
 
-    fn create_indexes(&mut self, indexes: &[(String, String)]) -> Result<()> {
-        for (name, sql) in indexes {
-            self.conn
-                .execute(sql, [])
-                .map_err(|e| Error::Corrupt(format!("unique index {name} cannot be rebuilt: {e}")))?;
+    // Writes a batch of rows (`None`: remove the row) and marks them for
+    // the state hash. All rows of the batch go first, then the new
+    // versions come in: a unique key can move from one row of the batch to
+    // another with the unique indexes in place.
+    fn put_rows(&mut self, rows: Vec<(u32, RowId, Option<Row>)>) -> Result<()> {
+        for (t, id, _) in &rows {
+            delete_row(&self.conn, &self.tables[*t as usize], *id)?;
+        }
+        for (t, id, row) in &rows {
+            if let Some(row) = row {
+                write_row(&self.conn, &self.tables[*t as usize], row).map_err(|e| match e {
+                    Error::Sql(e) => Error::Corrupt(format!("a merged row breaks a constraint: {e}")),
+                    e => e,
+                })?;
+            }
+            mark_dirty(&self.conn, *t, *id)?;
         }
         Ok(())
     }
@@ -775,23 +853,18 @@ impl Store {
     // last merge, and checks that the result has the base root hash.
     fn restore_base(&mut self, base_root: NodeHash) -> Result<()> {
         let undo: Vec<(Vec<u8>, u32, Option<Vec<u8>>)> = {
-            let mut stmt = self.conn.prepare("SELECT row_id, tbl, row FROM _synod_undo ORDER BY row_id")?;
+            let mut stmt = self.conn.prepare_cached("SELECT row_id, tbl, row FROM _synod_undo ORDER BY row_id")?;
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?
         };
-        for (id, tbl, row) in undo {
-            let schema = self.tables[tbl as usize].clone();
-            let row_id = parse_row_id(&id)?;
-            match row {
-                None => delete_row(&self.conn, &schema, row_id)?,
-                Some(bytes) => {
-                    let row =
-                        Row::from_canonical_bytes(&bytes).map_err(|e| Error::Corrupt(format!("undo row: {e}")))?;
-                    write_row(&self.conn, &schema, &row)?;
-                }
-            }
-            mark_dirty(&self.conn, tbl, row_id)?;
-        }
-        self.conn.execute("DELETE FROM _synod_undo", [])?;
+        let puts = undo
+            .into_iter()
+            .map(|(id, tbl, row)| {
+                let row = row.map(|b| Row::from_canonical_bytes(&b)).transpose();
+                Ok((tbl, parse_row_id(&id)?, row.map_err(|e| Error::Corrupt(format!("undo row: {e}")))?))
+            })
+            .collect::<Result<_>>()?;
+        self.put_rows(puts)?;
+        self.conn.prepare_cached("DELETE FROM _synod_undo")?.execute([])?;
         if self.refresh_state_hash()? != base_root {
             return Err(Error::Corrupt("the restored base state does not have the base root hash".into()));
         }
@@ -812,20 +885,16 @@ impl Store {
         let base_root = self.base_root()?;
         let next_epoch = self.next_merge_epoch()?;
         let me = self.config.node.0;
-        self.conn.execute("VACUUM INTO ?1", [path])?;
+        self.conn.prepare_cached("VACUUM INTO ?1")?.execute([path])?;
         {
             let mut copy = Store::open(path, self.config.clone(), self.env.clone())?;
             copy.in_txn(|s| {
-                let indexes = s.drop_unique_indexes()?;
                 s.restore_base(base_root)?;
-                s.create_indexes(&indexes)?;
                 // The copy has no log of its own. Log sequence numbers start
                 // again, so the state hash cursor starts again too.
                 s.conn.execute_batch("DELETE FROM _synod_log; DELETE FROM _synod_sealed; DELETE FROM _synod_dirty;")?;
-                s.conn.execute("DELETE FROM _synod_logs WHERE node = ?1 AND log_hash NOT IN (SELECT log_hash FROM _synod_merged_log)", [me])?;
-                s.conn.execute(
-                    "UPDATE _synod_node SET node = ?1, next_row = 0, next_txn = 0, hashed_seq = 0, open_epoch = max(open_epoch, ?2)",
-                    params![node.0, next_epoch as i64],
+                s.conn.prepare_cached("DELETE FROM _synod_logs WHERE node = ?1 AND log_hash NOT IN (SELECT log_hash FROM _synod_merged_log)")?.execute([me])?;
+                s.conn.prepare_cached("UPDATE _synod_node SET node = ?1, next_row = 0, next_txn = 0, hashed_seq = 0, open_epoch = max(open_epoch, ?2)")?.execute(params![node.0, next_epoch as i64],
                 )?;
                 Ok(())
             })?;
@@ -840,7 +909,7 @@ impl Store {
     /// and status, in row ID order.
     pub fn conflicts(&self) -> Result<Vec<(RowId, Conflict, String)>> {
         let schema = self.tables[0].clone();
-        let mut stmt = self.conn.prepare(&format!(
+        let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT \"_row_id\" FROM \"{}\" WHERE \"_tomb\" = 0 ORDER BY \"_row_id\"",
             schema.physical()
         ))?;
@@ -883,10 +952,8 @@ impl Store {
 }
 
 fn delete_row(conn: &Connection, schema: &TableSchema, id: RowId) -> Result<()> {
-    conn.execute(
-        &format!("DELETE FROM \"{}\" WHERE \"_row_id\" = ?1", schema.physical()),
-        [id.to_be_bytes().to_vec()],
-    )?;
+    conn.prepare_cached(&format!("DELETE FROM \"{}\" WHERE \"_row_id\" = ?1", schema.physical()))?
+        .execute([id.to_be_bytes().to_vec()])?;
     Ok(())
 }
 

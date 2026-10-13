@@ -12,6 +12,10 @@ synod-core.workspace = true
 rusqlite.workspace = true
 blake3.workspace = true
 
+[features]
+# Hooks that only tests use.
+test-hooks = []
+
 [dev-dependencies]
 synod-sim.workspace = true
 proptest.workspace = true

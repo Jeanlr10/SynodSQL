@@ -53,6 +53,11 @@ pub struct FaultConfig {
     pub crash_interval_ms: Option<(u64, u64)>,
     /// How long a crashed node stays down.
     pub downtime_ms: (u64, u64),
+    /// Chance per million that a crashed node stays down for a long time
+    /// instead (a late node).
+    pub long_downtime_per_million: u32,
+    /// How long a late node stays down.
+    pub long_downtime_ms: (u64, u64),
     /// Chance per million that a crash happens inside the node's next disk
     /// operations, not between events.
     pub crash_at_write_per_million: u32,
@@ -67,6 +72,8 @@ impl Default for FaultConfig {
         FaultConfig {
             crash_interval_ms: Some((1_000, 10_000)),
             downtime_ms: (100, 3_000),
+            long_downtime_per_million: 0,
+            long_downtime_ms: (30_000, 120_000),
             crash_at_write_per_million: 500_000,
             partition_interval_ms: Some((5_000, 30_000)),
             partition_duration_ms: (500, 10_000),
@@ -111,6 +118,15 @@ pub trait Node {
     fn on_message(&mut self, ctx: &mut Ctx<'_>, from: NodeIndex, msg: &[u8]);
     /// Handles a timer that this node set with [`Ctx::set_timer`].
     fn on_timer(&mut self, ctx: &mut Ctx<'_>, timer: u64);
+    /// Makes the node crash inside its `ops`-th next disk operation, if it
+    /// keeps its own crash-injecting storage (such as a
+    /// [`CrashFs`](crate::CrashFs)). Returns false to use the simulator's
+    /// [`Disk`] instead. The node must then panic with
+    /// [`CrashSignal`](crate::disk::CrashSignal) when the operation fails.
+    fn arm_crash(&mut self, ops: u64) -> bool {
+        let _ = ops;
+        false
+    }
 }
 
 enum Action {
@@ -126,8 +142,28 @@ pub struct Ctx<'a> {
     disk: &'a Disk,
     rng: &'a mut SimRng,
     actions: Vec<Action>,
-    trace: &'a mut Vec<u8>,
+    trace: &'a mut Trace,
     true_ms: u64,
+}
+
+/// The trace of a run: its BLAKE3 digest, and its text unless the text is
+/// turned off (long runs).
+pub(crate) struct Trace {
+    text: Option<Vec<u8>>,
+    hasher: blake3::Hasher,
+}
+
+impl std::io::Write for Trace {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        if let Some(t) = &mut self.text {
+            t.extend_from_slice(buf);
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Ctx<'_> {
@@ -226,8 +262,9 @@ pub struct Sim<N> {
     slots: Vec<Slot<N>>,
     rng: SimRng,
     boot: Option<BootFn<N>>,
-    trace: Vec<u8>,
+    trace: Trace,
     partitioned: bool,
+    faults_stopped: bool,
     stats: Stats,
 }
 
@@ -257,8 +294,9 @@ impl<N: Node> Sim<N> {
             slots,
             rng,
             boot: Some(Box::new(boot)),
-            trace: Vec::new(),
+            trace: Trace { text: Some(Vec::new()), hasher: blake3::Hasher::new() },
             partitioned: false,
+            faults_stopped: false,
             stats: Stats::default(),
             config,
         };
@@ -283,6 +321,18 @@ impl<N: Node> Sim<N> {
         self.slots[node].drift_ppm = drift_ppm;
     }
 
+    /// Stops new crashes and partitions, and heals the network now. Nodes
+    /// that are down still boot after their downtime; a crash already armed
+    /// inside a node's own storage is the node's to disarm.
+    pub fn stop_faults(&mut self) {
+        self.faults_stopped = true;
+        self.partitioned = false;
+        for slot in &mut self.slots {
+            slot.disk.disarm();
+        }
+        self.log(format_args!("faults stopped"));
+    }
+
     /// Returns the true time.
     pub fn now_ms(&self) -> u64 {
         self.now
@@ -301,6 +351,11 @@ impl<N: Node> Sim<N> {
         self.slots[node].node.as_ref()
     }
 
+    /// Returns a node to change it, or `None` while it is down.
+    pub fn node_mut(&mut self, node: NodeIndex) -> Option<&mut N> {
+        self.slots[node].node.as_mut()
+    }
+
     /// Returns the disk of a node.
     pub fn disk(&self, node: NodeIndex) -> &Disk {
         &self.slots[node].disk
@@ -311,14 +366,22 @@ impl<N: Node> Sim<N> {
         &self.stats
     }
 
-    /// Returns the trace: one line per event.
+    /// Returns the trace: one line per event (empty after
+    /// [`keep_trace(false)`](Sim::keep_trace)).
     pub fn trace(&self) -> &[u8] {
-        &self.trace
+        self.trace.text.as_deref().unwrap_or_default()
+    }
+
+    /// Keeps the text of the trace, or only its digest (for long runs).
+    pub fn keep_trace(&mut self, keep: bool) {
+        if !keep {
+            self.trace.text = None;
+        }
     }
 
     /// Returns the BLAKE3 hash of the trace, as hex.
     pub fn trace_digest(&self) -> String {
-        blake3::hash(&self.trace).to_hex().to_string()
+        self.trace.hasher.finalize().to_hex().to_string()
     }
 
     /// Runs until true time reaches `self.now_ms() + ms`.
@@ -362,6 +425,7 @@ impl<N: Node> Sim<N> {
                     self.with_node(node, |n, ctx| n.on_timer(ctx, id));
                 }
             }
+            Event::Crash | Event::Partition | Event::Heal if self.faults_stopped => {}
             Event::Crash => {
                 let up: Vec<NodeIndex> = (0..self.slots.len()).filter(|&i| self.slots[i].node.is_some()).collect();
                 if !up.is_empty() {
@@ -369,7 +433,10 @@ impl<N: Node> Sim<N> {
                     if self.rng.chance(self.config.faults.crash_at_write_per_million) {
                         let ops = self.rng.range(0, 4);
                         self.log(format_args!("arm crash n{node} after {ops} disk ops"));
-                        self.slots[node].disk.arm_crash(ops);
+                        let own = self.slots[node].node.as_mut().is_some_and(|n| n.arm_crash(ops));
+                        if !own {
+                            self.slots[node].disk.arm_crash(ops);
+                        }
                     } else {
                         self.crash(node);
                     }
@@ -430,7 +497,12 @@ impl<N: Node> Sim<N> {
         self.stats.crashes += 1;
         self.stats.lost_writes += lost as u64;
         self.log(format_args!("crash n{node}, {lost} unsynced ops lost"));
-        let (lo, hi) = self.config.faults.downtime_ms;
+        let faults = &self.config.faults;
+        let (lo, hi) = if faults.long_downtime_per_million > 0 && self.rng.chance(faults.long_downtime_per_million) {
+            faults.long_downtime_ms
+        } else {
+            faults.downtime_ms
+        };
         let after = self.rng.range(lo, hi);
         self.schedule(after, Event::Boot { node });
     }

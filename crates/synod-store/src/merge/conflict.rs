@@ -144,6 +144,17 @@ pub fn conflict_id(epoch: u64, table_name: &str, row_id: RowId, column: Option<u
     *h.finalize().as_bytes()
 }
 
+/// Returns the conflict ID of a write that its own node gave up, because
+/// its log was older than the lateness bound (specification Section 7.7).
+/// It includes the node, so that it differs from the ID of any conflict
+/// that a merge records, and from the give-ups of other nodes.
+pub fn given_up_id(node: NodeId, epoch: u64, table_name: &str, row_id: RowId) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key(CONFLICT_ID_CONTEXT);
+    h.update(&conflict_id(epoch, table_name, row_id, None, ConflictKind::StaleWrite));
+    h.update(&node.0.to_be_bytes());
+    *h.finalize().as_bytes()
+}
+
 /// Encodes a list of values: `count:u16`, then each value.
 pub fn encode_image(values: &[Value]) -> Vec<u8> {
     let mut out = (values.len() as u16).to_be_bytes().to_vec();

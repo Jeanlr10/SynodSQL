@@ -140,6 +140,11 @@ impl Disk {
         self.0.borrow_mut().crash_after_ops = Some(ops);
     }
 
+    /// Removes an armed crash that has not happened yet.
+    pub(crate) fn disarm(&self) {
+        self.0.borrow_mut().crash_after_ops = None;
+    }
+
     /// Loses unsynced data as a power loss would. Returns the number of
     /// unsynced operations that were lost or torn.
     pub(crate) fn crash(&self, rng: &mut SimRng) -> usize {

@@ -1,0 +1,20 @@
+[package]
+name = "synod-node"
+description = "SynodSQL node: the epoch cycle, log exchange, manifests, verify, catch-up, and repair, as a state machine without I/O"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+synod-core.workspace = true
+synod-store.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+synod-store = { workspace = true, features = ["test-hooks"] }
+synod-sim.workspace = true
+
+[lints]
+workspace = true
