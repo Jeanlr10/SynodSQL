@@ -415,6 +415,12 @@ fn main() {
     for &n in &a.rows {
         let mut cluster = Cluster::new(&a.dir, n);
         let mut rng = Rng(n as u64);
+        // Empty epochs until GC has dropped what the load left (its logs
+        // are kept 4 L epochs), so that no measured merge pays for it.
+        let warm = Picker::new(Dist::Uniform, n, &mut rng);
+        for _ in 0..=4 * LATENESS {
+            cluster.epoch(&warm, &mut rng, 0);
+        }
         for dist in dists {
             let picker = Picker::new(dist, n, &mut rng);
             for &delta in &a.deltas {
