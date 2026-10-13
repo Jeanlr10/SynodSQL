@@ -3,6 +3,8 @@
 //!
 //! [`serve`] runs one node: a [`Peer`] on its own thread, driven by a timer
 //! and by the messages that arrive, and a tokio runtime for the network.
+//! [`start`] runs it in the background, and gives a [`Running`] handle
+//! through which the program that runs the node can use its store.
 //! Each message goes as one HTTP/2 POST to `/synod/v1/msg` on the receiver,
 //! on a kept connection. The receiver checks that the client certificate
 //! names the node that the `x-synod-node` header gives.
@@ -94,9 +96,12 @@ pub struct ServeConfig {
 /// command, without the store path. Returns its output.
 pub type ExecFn = Box<dyn FnMut(&mut Store, &[String]) -> Result<String, String> + Send>;
 
+type Call = Box<dyn FnOnce(&mut Store) + Send>;
+
 enum Inbound {
     Msg(NodeId, Vec<u8>),
     Exec(Vec<String>, oneshot::Sender<Result<String, String>>),
+    Call(Call),
 }
 
 #[derive(Default)]
@@ -114,6 +119,66 @@ struct Shared {
 
 /// Runs a node until `stop` is set or the node fails.
 pub fn serve(peer: Peer, cfg: ServeConfig, exec: ExecFn, stop: Arc<AtomicBool>) -> Result<(), NetError> {
+    start(peer, cfg, exec, stop)?.wait()
+}
+
+/// A node that [`start`] runs in the background. Dropping it stops the node.
+pub struct Running {
+    stop: Arc<AtomicBool>,
+    inbound: mpsc::Sender<Inbound>,
+    node: Option<std::thread::JoinHandle<Result<(), NetError>>>,
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl Running {
+    /// Runs `f` on the node's store, on the node's thread, between two
+    /// messages, and returns its result.
+    pub fn call<R: Send + 'static>(&self, f: impl FnOnce(&mut Store) -> R + Send + 'static) -> Result<R, NetError> {
+        let (tx, rx) = mpsc::channel();
+        let call: Call = Box::new(move |s| {
+            let _ = tx.send(f(s));
+        });
+        self.inbound.send(Inbound::Call(call)).map_err(|_| NetError::Http("the node stopped".into()))?;
+        rx.recv().map_err(|_| NetError::Http("the node stopped".into()))
+    }
+
+    /// True while the node runs.
+    pub fn is_running(&self) -> bool {
+        self.node.as_ref().is_some_and(|n| !n.is_finished())
+    }
+
+    /// Stops the node and waits for it.
+    pub fn stop(self) -> Result<(), NetError> {
+        self.stop.store(true, Ordering::SeqCst);
+        self.wait()
+    }
+
+    /// Waits until the node stops: when `stop` is set, or it fails.
+    pub fn wait(mut self) -> Result<(), NetError> {
+        self.finish()
+    }
+
+    fn finish(&mut self) -> Result<(), NetError> {
+        let Some(node) = self.node.take() else { return Ok(()) };
+        let result = node.join().unwrap_or_else(|_| Err(NetError::Http("the node thread panicked".into())));
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(r) = self.runtime.take() {
+            r.shutdown_timeout(Duration::from_secs(1));
+        }
+        result
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = self.finish();
+    }
+}
+
+/// Starts a node in the background; it runs until `stop` is set, the node
+/// fails, or the handle is dropped.
+pub fn start(peer: Peer, cfg: ServeConfig, exec: ExecFn, stop: Arc<AtomicBool>) -> Result<Running, NetError> {
     let me = peer.store().config().node;
     let server_tls = tls::server_config(&cfg.tls)?;
     let client_tls = tls::client_config(&cfg.tls)?;
@@ -122,7 +187,7 @@ pub fn serve(peer: Peer, cfg: ServeConfig, exec: ExecFn, stop: Arc<AtomicBool>) 
     let shared = Arc::new(Shared {
         me,
         members: cfg.members.iter().map(|m| m.id).collect(),
-        inbound: Mutex::new(in_tx),
+        inbound: Mutex::new(in_tx.clone()),
         snapshot: Mutex::new(Snapshot::default()),
     });
     // One sender task per peer, each with its own connection.
@@ -140,10 +205,7 @@ pub fn serve(peer: Peer, cfg: ServeConfig, exec: ExecFn, stop: Arc<AtomicBool>) 
     let node = std::thread::Builder::new()
         .name(format!("synod-node-{}", me.0))
         .spawn(move || node_loop(peer, in_rx, outbound, exec, node_shared, node_stop, tick))?;
-    let result = node.join().unwrap_or_else(|_| Err(NetError::Http("the node thread panicked".into())));
-    stop.store(true, Ordering::SeqCst);
-    runtime.shutdown_timeout(Duration::from_secs(1));
-    result
+    Ok(Running { stop, inbound: in_tx, node: Some(node), runtime: Some(runtime) })
 }
 
 fn node_loop(
@@ -168,6 +230,7 @@ fn node_loop(
             Ok(Inbound::Exec(args, reply)) => {
                 let _ = reply.send(exec(peer.store_mut(), &args));
             }
+            Ok(Inbound::Call(f)) => f(peer.store_mut()),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }

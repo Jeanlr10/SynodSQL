@@ -3,14 +3,12 @@
 //! Two nodes sync by files: each seals its epoch and exports its log, the
 //! logs travel by any means, and each node merges them. See `synod help`.
 
-use std::fmt::Write as _;
 use std::process::ExitCode;
 
-use rusqlite::types::Value as Sql;
-use synod_core::log::{decode_log, log_hash};
-use synod_core::{NodeId, RowId, Value, ValueSet};
-use synod_store::schema::{Column, ColumnType};
+use synod_core::NodeId;
+use synod_core::log::log_hash;
 use synod_store::{Env, Error, Store, StoreConfig};
+use synodsql::command::{Args, STORE_COMMANDS, hex, store_command};
 
 const USAGE: &str = "\
 usage: synod <command> [arguments]
@@ -58,7 +56,11 @@ fn main() -> ExitCode {
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("synod: {e}");
+            if e.starts_with("missing ") {
+                eprintln!("synod: {e}\n\n{USAGE}");
+            } else {
+                eprintln!("synod: {e}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -66,55 +68,6 @@ fn main() -> ExitCode {
 
 fn err(e: Error) -> String {
     e.to_string()
-}
-
-/// Splits `--name value` options from positional arguments.
-struct Args {
-    positional: Vec<String>,
-    options: Vec<(String, Option<String>)>,
-}
-
-impl Args {
-    fn parse(args: &[String], flags: &[&str]) -> Args {
-        let mut positional = Vec::new();
-        let mut options = Vec::new();
-        let mut it = args.iter();
-        while let Some(a) = it.next() {
-            if let Some(name) = a.strip_prefix("--") {
-                if flags.contains(&name) {
-                    options.push((name.to_owned(), None));
-                } else {
-                    options.push((name.to_owned(), it.next().cloned()));
-                }
-            } else {
-                positional.push(a.clone());
-            }
-        }
-        Args { positional, options }
-    }
-
-    fn opt(&self, name: &str) -> Option<&str> {
-        self.options.iter().find(|(n, _)| n == name).and_then(|(_, v)| v.as_deref())
-    }
-
-    fn flag(&self, name: &str) -> bool {
-        self.options.iter().any(|(n, _)| n == name)
-    }
-
-    fn num(&self, name: &str, default: u64) -> R<u64> {
-        self.opt(name).map_or(Ok(default), |v| v.parse().map_err(|_| format!("--{name}: not a number: {v}")))
-    }
-
-    fn at(&self, i: usize, what: &str) -> R<&str> {
-        self.positional.get(i).map(String::as_str).ok_or_else(|| format!("missing {what}\n\n{USAGE}"))
-    }
-
-    fn known(&self, names: &[&str]) -> R<()> {
-        match self.options.iter().find(|(n, _)| !names.contains(&n.as_str())) {
-            Some((n, _)) => Err(format!("unknown option --{n}")),
-            None => Ok(()),
-        }
-    }
 }
 
 /// The environment. `SYNOD_NOW_MS` fixes the clock, for scripts and tests.
@@ -130,11 +83,6 @@ fn env() -> R<Env> {
 fn open(path: &str) -> R<Store> {
     Store::open_existing(path, env()?).map_err(err)
 }
-
-/// Commands that work on an open store. A running node takes them too
-/// (`synod remote`).
-const STORE_COMMANDS: [&str; 9] =
-    ["status", "create-table", "insert", "update", "delete", "query", "conflicts", "resolve", "revert"];
 
 fn run(args: &[String]) -> R<()> {
     let Some((cmd, rest)) = args.split_first() else { return Err(USAGE.into()) };
@@ -177,22 +125,13 @@ fn run(args: &[String]) -> R<()> {
         "seal" => {
             a.known(&[])?;
             let mut s = open(a.at(0, "<db>")?)?;
-            let mut any = false;
-            loop {
-                match s.seal() {
-                    Ok(l) => {
-                        any = true;
-                        println!("sealed epoch {}: {} writes, log {}", l.epoch, l.entries, hex(&l.hash));
-                    }
-                    Err(Error::TooEarly { epoch, ends_at_ms }) => {
-                        if !any {
-                            let wait = ends_at_ms.saturating_sub(s.now_ms());
-                            println!("epoch {epoch} is still open ({:.1} s left)", wait as f64 / 1000.0);
-                        }
-                        break;
-                    }
-                    Err(e) => return Err(err(e)),
-                }
+            let (sealed, epoch, ends_at_ms) = synodsql::seal_ended(&mut s).map_err(|e| e.0)?;
+            for l in &sealed {
+                println!("sealed epoch {}: {} writes, log {}", l.epoch, l.entries, hex(&l.hash));
+            }
+            if sealed.is_empty() {
+                let wait = ends_at_ms.saturating_sub(s.now_ms());
+                println!("epoch {epoch} is still open ({:.1} s left)", wait as f64 / 1000.0);
             }
         }
         "export" => {
@@ -207,31 +146,14 @@ fn run(args: &[String]) -> R<()> {
         "merge" => {
             a.known(&[])?;
             let mut s = open(a.at(0, "<db>")?)?;
-            let me = s.config().node;
-            // (epoch, node, bytes) of each given log.
             let mut logs = Vec::new();
             for file in &a.positional[1..] {
                 let bytes = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
-                let (h, _) = decode_log(&bytes).map_err(|e| format!("{file}: {e}"))?;
-                if h.node != me {
-                    logs.push((h.epoch, bytes));
-                }
+                synod_core::log::decode_log(&bytes).map_err(|e| format!("{file}: {e}"))?;
+                logs.push(bytes);
             }
-            let mut merged = 0;
-            loop {
-                let epoch = s.next_merge_epoch().map_err(err)?;
-                if s.sealed(epoch).map_err(err)?.is_none() {
-                    break;
-                }
-                // The logs of this epoch, and late logs that no merge took.
-                let mut take = Vec::new();
-                for (e, bytes) in &logs {
-                    if *e == epoch || (*e < epoch && s.log_merged_in(&log_hash(bytes)).map_err(err)?.is_none()) {
-                        take.push(bytes.clone());
-                    }
-                }
-                let r = s.merge(epoch, &take).map_err(err)?;
-                merged += 1;
+            let merged = synodsql::merge_logs(&mut s, &logs).map_err(|e| e.0)?;
+            for (epoch, r) in &merged {
                 println!(
                     "merged epoch {epoch}: {} logs, {} conflicts, root {}",
                     r.logs.len(),
@@ -239,32 +161,21 @@ fn run(args: &[String]) -> R<()> {
                     hex(&r.root)
                 );
             }
-            if merged == 0 {
+            if merged.is_empty() {
                 println!("nothing to merge: seal epoch {} first", s.next_merge_epoch().map_err(err)?);
             }
         }
         "certs" => {
             a.known(&["nodes", "clients"])?;
-            let dir = std::path::Path::new(a.at(0, "<dir>")?);
-            let nodes: Vec<NodeId> = list(a.opt("nodes").ok_or("certs needs --nodes <id,id,...>")?)
+            let dir = a.at(0, "<dir>")?;
+            let nodes: Vec<u32> = list(a.opt("nodes").ok_or("certs needs --nodes <id,id,...>")?)
                 .iter()
-                .map(|n| n.parse().map(NodeId).map_err(|_| format!("--nodes: not a node ID: {n}")))
+                .map(|n| n.parse().map_err(|_| format!("--nodes: not a node ID: {n}")))
                 .collect::<R<_>>()?;
             let clients = list(a.opt("clients").unwrap_or("admin"));
             let clients: Vec<&str> = clients.iter().map(String::as_str).collect();
-            let certs = synod_net::make_certs(&nodes, &clients).map_err(|e| e.to_string())?;
-            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            let write = |name: String, data: &str| {
-                let path = dir.join(name);
-                std::fs::write(&path, data).map_err(|e| format!("{}: {e}", path.display()))
-            };
-            write("ca.pem".into(), &certs.ca_pem)?;
-            write("ca.key".into(), &certs.ca_key_pem)?;
-            for (name, cert, key) in &certs.issued {
-                write(format!("{name}.pem"), cert)?;
-                write(format!("{name}.key"), key)?;
-            }
-            println!("wrote the CA and {} certificates to {}", certs.issued.len(), dir.display());
+            let issued = synodsql::make_certs(dir, &nodes, &clients).map_err(|e| e.0)?;
+            println!("wrote the CA and {issued} certificates to {dir}");
         }
         "serve" => {
             a.known(&["listen", "peers", "certs", "tick-ms", "no-quorum", "gossip"])?;
@@ -292,15 +203,7 @@ fn run(args: &[String]) -> R<()> {
             let tick_ms = a.num("tick-ms", (store.config().epoch_len_ms / 20).clamp(10, 1_000))?;
             let peer = synod_node::Peer::new(store, cfg).map_err(err)?;
             println!("node {me} serving on {listen} with {} members", members.len());
-            let exec: synod_net::ExecFn = Box::new(|s, args| {
-                let (cmd, rest) = args.split_first().ok_or("empty command")?;
-                if !STORE_COMMANDS.contains(&cmd.as_str()) {
-                    return Err(format!("{cmd} cannot run on a remote node"));
-                }
-                let mut a = Args::parse(rest, &["all"]);
-                a.positional.insert(0, "-".into());
-                store_command(s, cmd, &a)
-            });
+            let exec: synod_net::ExecFn = Box::new(synodsql::command::run);
             let config = synod_net::ServeConfig { listen, members, tls, tick_ms };
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             synod_net::serve(peer, config, exec, stop).map_err(|e| e.to_string())?;
@@ -320,15 +223,7 @@ fn listen_addr_string(a: &std::net::SocketAddr) -> String {
 }
 
 fn load_tls(dir: &str, name: &str) -> R<synod_net::Tls> {
-    let read = |f: String| {
-        let path = std::path::Path::new(dir).join(f);
-        std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
-    };
-    Ok(synod_net::Tls {
-        ca_pem: read("ca.pem".into())?,
-        cert_pem: read(format!("{name}.pem"))?,
-        key_pem: read(format!("{name}.key"))?,
-    })
+    synodsql::load_tls(dir, name).map_err(|e| e.0)
 }
 
 /// `synod remote <host:port> --to <id> --certs <dir> [--as <name>] <command> ...`:
@@ -366,225 +261,4 @@ fn remote(rest: &[String]) -> R<()> {
     }
     print!("{text}");
     Ok(())
-}
-
-/// Runs a store command. `a.positional[0]` names the store and is not read.
-fn store_command(s: &mut Store, cmd: &str, a: &Args) -> R<String> {
-    let mut out = String::new();
-    match cmd {
-        "status" => {
-            a.known(&[])?;
-            let c = s.config().clone();
-            let merged = s.merged_epoch().map_err(err)?.map_or("none".into(), |e| e.to_string());
-            let _ = writeln!(out, "node            {}", c.node);
-            let _ = writeln!(out, "epoch length    {} ms (genesis {} ms)", c.epoch_len_ms, c.genesis_ms);
-            let _ = writeln!(out, "lateness        {} epochs", c.lateness);
-            let _ = writeln!(out, "open epoch      {}", s.open_epoch().map_err(err)?);
-            let _ = writeln!(out, "merged epoch    {merged}");
-            let _ = writeln!(out, "next to merge   {}", s.next_merge_epoch().map_err(err)?);
-            let _ = writeln!(out, "head manifest   {}", hex(&s.head().map_err(err)?));
-            let _ = writeln!(out, "unsealed writes {}", s.unsealed_entries().map_err(err)?.len());
-            let _ = writeln!(out, "base root       {}", hex(&s.base_root().map_err(err)?));
-            let _ = writeln!(out, "state hash      {}", hex(&s.state_hash().map_err(err)?));
-            let tables: Vec<&str> = s.tables().iter().map(|t| t.name.as_str()).collect();
-            let _ = writeln!(out, "tables          {}", tables.join(", "));
-        }
-        "create-table" => {
-            a.known(&[])?;
-            let t = s.create_table(a.at(1, "<statement>")?).map_err(err)?;
-            let _ = writeln!(out, "{}", t.ddl);
-        }
-        "insert" => {
-            a.known(&[])?;
-            let table = s.table(a.at(1, "<table>")?).map_err(err)?;
-            let cols = assignments(&table.columns, &a.positional[2..])?;
-            let given: Vec<(&str, Value)> = cols.iter().map(|(n, v)| (n.as_str(), v.clone())).collect();
-            let mut t = s.begin().map_err(err)?;
-            let id = t.insert(&table.name, &given).map_err(err)?;
-            t.commit().map_err(err)?;
-            let _ = writeln!(out, "{id}");
-        }
-        "update" => {
-            a.known(&[])?;
-            let table = s.table(a.at(1, "<table>")?).map_err(err)?;
-            let id = parse_row_id(a.at(2, "<row-id>")?)?;
-            let cols = assignments(&table.columns, &a.positional[3..])?;
-            let given: Vec<(&str, Value)> = cols.iter().map(|(n, v)| (n.as_str(), v.clone())).collect();
-            let mut t = s.begin().map_err(err)?;
-            t.update(&table.name, id, &given).map_err(err)?;
-            t.commit().map_err(err)?;
-        }
-        "delete" => {
-            a.known(&[])?;
-            let table = a.at(1, "<table>")?.to_owned();
-            let id = parse_row_id(a.at(2, "<row-id>")?)?;
-            let mut t = s.begin().map_err(err)?;
-            t.delete(&table, id).map_err(err)?;
-            t.commit().map_err(err)?;
-        }
-        "query" => {
-            a.known(&[])?;
-            let (names, rows) = s.query_named(a.at(1, "<select>")?, &[]).map_err(err)?;
-            out += &table(&names, &rows.iter().map(|r| r.iter().map(show).collect()).collect::<Vec<_>>());
-        }
-        "conflicts" => {
-            a.known(&["all"])?;
-            let mut rows = Vec::new();
-            for (id, c, status) in s.conflicts().map_err(err)? {
-                if status != "open" && !a.flag("all") {
-                    continue;
-                }
-                let recorded: Vec<String> =
-                    c.recorded.iter().map(|r| format!("{}@{}: {}", r.node, r.hlc, values(&r.values))).collect();
-                rows.push(vec![
-                    id.to_string(),
-                    c.epoch.to_string(),
-                    c.kind.to_string(),
-                    format!("{}{}", c.table_name, c.column_name.map(|n| format!(".{n}")).unwrap_or_default()),
-                    c.row_id.to_string(),
-                    c.rule.clone(),
-                    c.applied.as_deref().map_or("(deleted)".into(), values),
-                    recorded.join("; "),
-                    status,
-                ]);
-            }
-            let names = ["conflict", "epoch", "kind", "target", "row", "rule", "applied", "recorded", "status"];
-            out += &table(&names.map(String::from), &rows);
-        }
-        "resolve" => {
-            a.known(&[])?;
-            let id = parse_row_id(a.at(1, "<conflict-row-id>")?)?;
-            let mut t = s.begin().map_err(err)?;
-            t.update("_conflicts", id, &[("status", Value::Text("resolved".into()))]).map_err(err)?;
-            t.commit().map_err(err)?;
-        }
-        "revert" => {
-            a.known(&["node", "from", "to"])?;
-            let node = a.opt("node").ok_or("revert needs --node <id>")?;
-            let node = NodeId(node.parse().map_err(|_| format!("--node: not a node ID: {node}"))?);
-            let from = a.num("from", 0)?;
-            let to = a.num("to", u64::MAX)?;
-            let mut t = s.begin().map_err(err)?;
-            let r = t.revert(node, from..=to).map_err(err)?;
-            t.commit().map_err(err)?;
-            let _ = writeln!(
-                out,
-                "reverted node {node}: {} rows deleted, {} columns restored, {} rows inserted again, {} skipped",
-                r.deleted, r.restored, r.reinserted, r.skipped
-            );
-        }
-        other => return Err(format!("unknown command {other}")),
-    }
-    Ok(out)
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-fn parse_row_id(s: &str) -> R<RowId> {
-    let bad = || format!("not a row ID: {s} (expected like 0000000a-0000000000000003)");
-    let (n, c) = s.split_once('-').ok_or_else(bad)?;
-    let node = u32::from_str_radix(n, 16).map_err(|_| bad())?;
-    let counter = u64::from_str_radix(c, 16).map_err(|_| bad())?;
-    Ok(RowId::new(NodeId(node), counter))
-}
-
-fn assignments(columns: &[Column], args: &[String]) -> R<Vec<(String, Value)>> {
-    args.iter()
-        .map(|a| {
-            let (name, raw) = a.split_once('=').ok_or_else(|| format!("expected col=value, found {a}"))?;
-            let column = columns
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(name))
-                .ok_or_else(|| format!("no column {name}"))?;
-            Ok((column.name.clone(), parse_value(&column.ty, raw)?))
-        })
-        .collect()
-}
-
-fn parse_value(ty: &ColumnType, raw: &str) -> R<Value> {
-    if raw == "NULL" {
-        return Ok(Value::Null);
-    }
-    let bad = || format!("{raw:?} is not a {ty}");
-    Ok(match ty {
-        ColumnType::Integer => Value::Integer(raw.parse().map_err(|_| bad())?),
-        ColumnType::Real => Value::Real(raw.parse().map_err(|_| bad())?),
-        ColumnType::Text => Value::Text(raw.to_owned()),
-        ColumnType::Decimal { .. } => Value::Decimal(raw.parse().map_err(|_| bad())?),
-        ColumnType::Blob => {
-            let digits = raw.strip_prefix("x'").and_then(|r| r.strip_suffix('\'')).ok_or_else(bad)?;
-            if digits.len() % 2 != 0 {
-                return Err(bad());
-            }
-            let bytes: Option<Vec<u8>> =
-                (0..digits.len()).step_by(2).map(|i| u8::from_str_radix(&digits[i..i + 2], 16).ok()).collect();
-            Value::Blob(bytes.ok_or_else(bad)?)
-        }
-        ColumnType::Set(item) => {
-            let items = if raw.is_empty() {
-                Vec::new()
-            } else {
-                raw.split(',').map(|p| parse_value(item, p)).collect::<R<_>>()?
-            };
-            Value::Set(ValueSet::new(items).ok_or_else(bad)?)
-        }
-    })
-}
-
-fn value(v: &Value) -> String {
-    match v {
-        Value::Null => "NULL".into(),
-        Value::Integer(i) => i.to_string(),
-        Value::Real(r) => r.to_string(),
-        Value::Decimal(d) => d.to_string(),
-        Value::Text(t) => t.escape_debug().to_string(),
-        Value::Blob(b) => format!("x'{}'", hex(b)),
-        Value::Set(s) => format!("{{{}}}", s.items().iter().map(value).collect::<Vec<_>>().join(", ")),
-    }
-}
-
-fn values(vs: &[Value]) -> String {
-    vs.iter().map(value).collect::<Vec<_>>().join(", ")
-}
-
-// Shows a SQL result value. A 16-byte blob that is a row ID shows as one,
-// and a blob that is an encoded set shows as the set.
-fn show(v: &Sql) -> String {
-    match v {
-        Sql::Null => "NULL".into(),
-        Sql::Integer(i) => i.to_string(),
-        Sql::Real(r) => r.to_string(),
-        Sql::Text(t) => t.escape_debug().to_string(),
-        Sql::Blob(b) => {
-            if let Some(id) = b.as_slice().try_into().ok().and_then(RowId::from_be_bytes) {
-                id.to_string()
-            } else if let Ok(set @ Value::Set(_)) = Value::from_canonical_bytes(b) {
-                value(&set)
-            } else {
-                format!("x'{}'", hex(b))
-            }
-        }
-    }
-}
-
-fn table(names: &[String], rows: &[Vec<String>]) -> String {
-    let mut out = String::new();
-    let mut width: Vec<usize> = names.iter().map(|n| n.chars().count()).collect();
-    for r in rows {
-        for (w, c) in width.iter_mut().zip(r) {
-            *w = (*w).max(c.chars().count());
-        }
-    }
-    let line = |cells: &[String]| {
-        let parts: Vec<String> = cells.iter().zip(&width).map(|(c, w)| format!("{c:<w$}")).collect();
-        format!("{}\n", parts.join("  ").trim_end())
-    };
-    out += &line(names);
-    for r in rows {
-        out += &line(r);
-    }
-    let _ = writeln!(out, "({} row{})", rows.len(), if rows.len() == 1 { "" } else { "s" });
-    out
 }

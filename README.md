@@ -94,7 +94,45 @@ let report = store.merge(epoch, &other_logs)?;     // M(e), conflicts, root hash
 | The node state machine: leaders, manifests, verify, catch-up, repair (no I/O) | [`crates/synod-node`](crates/synod-node) |
 | The network transport: HTTP/2 with mutual TLS | [`crates/synod-net`](crates/synod-net) |
 | The `synod` command | [`crates/synod-cli`](crates/synod-cli) |
+| The library API: `synodsql::Database` | [`crates/synodsql`](crates/synodsql) |
+| C and C++ API: `libsynod`, `synod.h`, `synod.hpp` | [`crates/synodsql-ffi`](crates/synodsql-ffi) |
+| Python module `synodsql` | [`crates/synodsql-py`](crates/synodsql-py) |
 | Deterministic simulator, and a SQLite VFS with crash injection | [`crates/synod-sim`](crates/synod-sim) |
+
+## Use as a library
+
+One API, `synodsql::Database`, in three languages: open or create a node store, write and query it, sync it by files, or run it as a cluster node in the background while the program goes on using it. Each tag `v<version>` builds Python wheels (Linux x86-64 and ARM64, macOS, Windows) and the C library for each platform, and attaches them to the GitHub release ([`release.yml`](.github/workflows/release.yml)).
+
+Python (`pip install synodsql`, or a wheel from a release):
+
+```python
+import synodsql
+
+with synodsql.Database.create("node.db", node=1) as db:
+    db.create_table("CREATE TABLE stock (row_id ROWID, sku TEXT UNIQUE, qty INTEGER MERGE delta)")
+    row = db.insert("stock", sku="A-100", qty=800)
+    db.update("stock", row, qty=650)
+    print(db.query("SELECT sku, qty FROM stock WHERE qty > ?1", [100]))
+    db.serve("0.0.0.0:7001", [(1, "10.0.0.1:7001"), (2, "10.0.0.2:7001")], "certs")
+```
+
+C++ (`synod.hpp` over the C API in `synod.h`; link with `-lsynod`):
+
+```cpp
+auto db = synod::Database::create("node.db", 1);
+db.create_table("CREATE TABLE stock (sku TEXT UNIQUE, qty INTEGER MERGE delta)");
+auto id = db.insert("stock", {{"sku", "A-100"}, {"qty", "800"}});
+auto rows = db.query("SELECT qty FROM stock WHERE sku = ?1", {synod::Value("A-100")});
+```
+
+Rust (`synodsql = { git = "https://github.com/Jeanlr10/SynodSQL" }`):
+
+```rust
+let mut db = synodsql::Database::create("node.db", &synodsql::Options::new(1))?;
+let id = db.insert("stock", &[("sku", Param::Text("A-100".into())), ("qty", Param::Integer(800))])?;
+```
+
+To build them here: `cargo build --release -p synodsql-ffi` (in `target/release`), and `maturin build -m crates/synodsql-py/Cargo.toml`. `scripts/test-bindings.sh` builds both and runs their tests.
 
 ## Build and test
 
@@ -125,7 +163,7 @@ scripts/gate.sh five 10000 1 12      # 5 nodes, 10,000 epochs, seeds 1 to 12
 scripts/gate.sh fifty 10000 2 9      # 50 nodes
 ```
 
-Before you push, `scripts/ci.sh` runs the CI checks on your machine: formatting, clippy, the minimum Rust version, and the tests. `--full` adds the long simulation job, and `--update` first updates the stable toolchain, because CI uses the latest one.
+Before you push, `scripts/ci.sh` runs the CI checks on your machine: formatting, clippy, the minimum Rust version, the tests, and the bindings (it needs a C and C++ compiler and Python 3). `--full` adds the long simulation job, and `--update` first updates the stable toolchain, because CI uses the latest one.
 
 To build the `synod` command: `cargo install --path crates/synod-cli`.
 

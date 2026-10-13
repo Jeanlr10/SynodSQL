@@ -1,0 +1,21 @@
+[package]
+name = "synodsql"
+description = "SynodSQL as a library: open a node store, write, query, sync by files, or serve as a cluster node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["database", "sqlite", "replication", "merge", "sql"]
+categories = ["database-implementations"]
+
+[dependencies]
+synod-core.workspace = true
+synod-store.workspace = true
+synod-node.workspace = true
+synod-net.workspace = true
+rusqlite.workspace = true
+
+[lints]
+workspace = true

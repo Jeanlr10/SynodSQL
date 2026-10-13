@@ -2,13 +2,13 @@
 # Runs the CI jobs of .github/workflows/ci.yml on this machine, in the
 # order of their cost, and stops at the first failure.
 #
-#   scripts/ci.sh          lint, msrv, test
+#   scripts/ci.sh          lint, msrv, test, bindings
 #   scripts/ci.sh --full   also the simulation job (release, many seeds; long)
 #   scripts/ci.sh --update first update the stable toolchain, as CI uses the
 #                          latest stable
 #
-# The test job also runs on ARM64 and macOS in CI; this script runs it on
-# this machine only.
+# The test job also runs on ARM64 and macOS in CI, and the bindings on
+# macOS and Windows; this script runs them on this machine only.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -41,6 +41,9 @@ cargo +"$msrv" check --workspace --all-targets --locked
 
 step "test: cargo test --workspace --locked"
 cargo test --workspace --locked
+
+step "bindings: scripts/test-bindings.sh"
+scripts/test-bindings.sh
 
 if [ "$full" = 1 ]; then
     step "simulation: cargo test --workspace --release --locked (CI seeds)"

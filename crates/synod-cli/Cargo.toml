@@ -16,6 +16,7 @@ synod-core.workspace = true
 synod-store.workspace = true
 synod-node.workspace = true
 synod-net.workspace = true
+synodsql.workspace = true
 rusqlite.workspace = true
 
 [lints]

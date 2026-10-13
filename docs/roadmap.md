@@ -148,6 +148,7 @@ Nodes run epochs automatically over a network. At the end of this phase, SynodSQ
 - [x] Revert tool: write a revert log that undoes a chosen node's changes — `Txn::revert`
 - [x] Metrics: epoch duration, log sizes, conflict counts, hash mismatches — `synod-node/src/metrics.rs`
 - [x] Merges by manifest and unmerge, for a manifest of higher priority — `Store::merge_manifest`, `Store::unmerge`
+- [x] Libraries: `synodsql::Database` in Rust, C and C++ (`libsynod`, `synod.h`, `synod.hpp`), and Python (`synodsql`), with a node that serves in the background while the program uses it (`synod_net::start`); each tag builds wheels and C libraries for Linux, macOS and Windows — `crates/synodsql*`, `.github/workflows/release.yml`
 
 **Addition to the white paper's rule:** by default, a leader publishes a manifest only when it has the logs of a majority of the nodes (`PeerConfig::quorum`). Without it, a minority side of a partition makes its own chain of merges and loses it later, when the majority's chain wins. The rule can be turned off.
 

@@ -31,6 +31,39 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace --locked
 
+  bindings:
+    # The C library (C and C++ tests) and the Python module (pytest).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: scripts/test-bindings.sh
+
+  bindings-windows:
+    # Windows is not in the test job: build the C library and the Python
+    # module, and run the Python tests.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: cargo build --release --locked -p synodsql-ffi
+      - shell: bash
+        run: |
+          python -m pip install maturin pytest
+          maturin build --release --locked -m crates/synodsql-py/Cargo.toml -o dist
+          python -m pip install --no-index --find-links dist synodsql
+          cd dist && python -m pytest -q ../crates/synodsql-py/tests
+
   msrv:
     runs-on: ubuntu-latest
     steps:

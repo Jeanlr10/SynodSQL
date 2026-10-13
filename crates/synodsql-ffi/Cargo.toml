@@ -1,0 +1,19 @@
+[package]
+name = "synodsql-ffi"
+description = "SynodSQL C API (synod.h) and C++ wrapper (synod.hpp): libsynod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "synod"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+synodsql.workspace = true
+
+[lints.rust]
+missing_docs = "warn"
