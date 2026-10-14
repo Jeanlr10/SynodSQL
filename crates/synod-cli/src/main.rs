@@ -49,7 +49,7 @@ Cluster (HTTP/2 with mutual TLS):
 
 Values: NULL, numbers, text as is, blobs as x'0a1b', sets as a,b,c.
 A row ID looks like 0000000a-0000000000000003.
-SYNOD_NOW_MS=<ms> fixes the clock (for scripts and tests).";
+SYNOD_NOW_MS=<ms> fixes the clock (for scripts and tests). synod --version prints the version.";
 
 type R<T> = Result<T, String>;
 
@@ -224,6 +224,7 @@ fn run(args: &[String]) -> R<()> {
             synod_net::serve(peer, config, exec, stop).map_err(|e| e.to_string())?;
         }
         "help" | "--help" | "-h" => println!("{USAGE}"),
+        "version" | "--version" | "-V" => println!("synod {}", env!("CARGO_PKG_VERSION")),
         other => return Err(format!("unknown command {other}\n\n{USAGE}")),
     }
     Ok(())
